@@ -1,0 +1,367 @@
+//! Matter epoch conversion and device clock assessment.
+//!
+//! Matter UTC time is microseconds since 2000-01-01T00:00:00Z (the "Matter
+//! epoch"), not the Unix epoch. `jiff::Timestamp` is the lingua franca
+//! everywhere else in this program; [`MatterMicros`] exists only at the wire
+//! boundary. Unlike matter.js, rs-matter passes spec values through
+//! unconverted, so no Unix-epoch API shift exists here.
+
+use std::fmt;
+
+use jiff::Timestamp;
+
+pub const MATTER_EPOCH_UNIX_SECONDS: i64 = 946_684_800;
+const MATTER_EPOCH_UNIX_MICROS: i64 = MATTER_EPOCH_UNIX_SECONDS * 1_000_000;
+
+/// Microseconds since the Matter epoch, as carried in Time Synchronization
+/// cluster attributes and commands.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct MatterMicros(pub u64);
+
+impl MatterMicros {
+    pub fn now() -> Self {
+        Self::from_timestamp(Timestamp::now())
+    }
+
+    /// Panics on pre-2000 timestamps, which cannot be represented on the
+    /// wire and cannot arise from a running host clock we already required
+    /// to be NTP-synchronized.
+    pub fn from_timestamp(at: Timestamp) -> Self {
+        let micros = at.as_microsecond() - MATTER_EPOCH_UNIX_MICROS;
+        Self(u64::try_from(micros).expect("timestamp precedes the Matter epoch"))
+    }
+
+    pub fn to_timestamp(self) -> Timestamp {
+        Timestamp::from_microsecond(self.0 as i64 + MATTER_EPOCH_UNIX_MICROS)
+            .expect("Matter timestamp out of jiff range")
+    }
+
+    /// Signed delta `self - other` in microseconds.
+    pub fn delta_micros(self, other: Self) -> i64 {
+        self.0 as i64 - other.0 as i64
+    }
+}
+
+impl fmt::Display for MatterMicros {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.to_timestamp().fmt(f)
+    }
+}
+
+/// A device is treated as epoch-confused when its clock delta lands within
+/// this window of the exact Unix/Matter epoch distance: firmware that encodes
+/// Unix-epoch values on the wire reads as ~30 years ahead after decoding. A
+/// week comfortably covers any real drift while remaining astronomically far
+/// from every honest delta.
+const EPOCH_SHIFT_DETECTION_WINDOW_MICROS: i64 = 7 * 86_400 * 1_000_000;
+
+/// How the device's reported clock relates to the host clock.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClockAssessment {
+    /// The device lost its clock (null utcTime, e.g. after a power outage).
+    Unset,
+    /// The device reported a time `delta_micros` away from the host's.
+    Offset {
+        /// Raw reported delta (device minus host), exact.
+        delta_micros: i64,
+        /// True when the delta is the Unix/Matter epoch distance: the device
+        /// firmware encodes the wrong epoch on the wire (off-spec).
+        epoch_shifted: bool,
+    },
+}
+
+impl ClockAssessment {
+    pub fn compare(device: Option<MatterMicros>, host: MatterMicros) -> Self {
+        let Some(device) = device else {
+            return Self::Unset;
+        };
+        let delta_micros = device.delta_micros(host);
+        let shift_error = delta_micros - MATTER_EPOCH_UNIX_MICROS;
+        Self::Offset {
+            delta_micros,
+            epoch_shifted: shift_error.abs() <= EPOCH_SHIFT_DETECTION_WINDOW_MICROS,
+        }
+    }
+
+    /// The device's real clock error: the raw delta with any detected epoch
+    /// shift folded out. `None` when the clock was unset.
+    pub fn effective_delta_micros(&self) -> Option<i64> {
+        match *self {
+            Self::Unset => None,
+            Self::Offset {
+                delta_micros,
+                epoch_shifted,
+            } => Some(if epoch_shifted {
+                delta_micros - MATTER_EPOCH_UNIX_MICROS
+            } else {
+                delta_micros
+            }),
+        }
+    }
+
+    pub fn is_epoch_shifted(&self) -> bool {
+        matches!(
+            self,
+            Self::Offset {
+                epoch_shifted: true,
+                ..
+            }
+        )
+    }
+}
+
+impl fmt::Display for ClockAssessment {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Unset => f.write_str("device clock was unset"),
+            Self::Offset { epoch_shifted, .. } => {
+                let effective = self
+                    .effective_delta_micros()
+                    .expect("Offset always has a delta");
+                if *epoch_shifted {
+                    write!(
+                        f,
+                        "device encodes Unix-epoch time on the wire (off-spec); corrected, its clock was {}",
+                        DescribeDelta(effective)
+                    )
+                } else {
+                    write!(f, "device clock was {}", DescribeDelta(effective))
+                }
+            }
+        }
+    }
+}
+
+/// "within 1s of host time (412ms behind)" / "1m 23s ahead" for a signed delta.
+struct DescribeDelta(i64);
+
+impl fmt::Display for DescribeDelta {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let magnitude = self.0.unsigned_abs();
+        let direction = if self.0 < 0 { "behind" } else { "ahead" };
+        if magnitude < 1_000_000 {
+            write!(
+                f,
+                "within 1s of host time ({} {direction})",
+                CompactDuration(magnitude)
+            )
+        } else {
+            write!(f, "{} {direction}", CompactDuration(magnitude))
+        }
+    }
+}
+
+/// Compact human duration: 412ms, 3.2s, 1m 23s, 1d 1h 1m.
+pub struct CompactDuration(pub u64);
+
+impl fmt::Display for CompactDuration {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let micros = self.0;
+        if micros < 1_000 {
+            return write!(f, "{micros}us");
+        }
+        if micros < 1_000_000 {
+            return write!(f, "{}ms", micros / 1_000);
+        }
+        let total_seconds = micros / 1_000_000;
+        if total_seconds < 60 {
+            let tenths = (micros % 1_000_000) / 100_000;
+            return if tenths == 0 {
+                write!(f, "{total_seconds}s")
+            } else {
+                write!(f, "{total_seconds}.{tenths}s")
+            };
+        }
+        let days = total_seconds / 86_400;
+        let hours = (total_seconds % 86_400) / 3_600;
+        let minutes = (total_seconds % 3_600) / 60;
+        let seconds = total_seconds % 60;
+        let mut parts: Vec<String> = Vec::new();
+        if days > 0 {
+            parts.push(format!("{days}d"));
+        }
+        if hours > 0 {
+            parts.push(format!("{hours}h"));
+        }
+        if minutes > 0 {
+            parts.push(format!("{minutes}m"));
+        }
+        if seconds > 0 && days == 0 {
+            parts.push(format!("{seconds}s"));
+        }
+        f.write_str(&parts.join(" "))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn ts(s: &str) -> Timestamp {
+        s.parse().unwrap()
+    }
+
+    #[test]
+    fn matter_epoch_zero_is_year_2000() {
+        assert_eq!(
+            MatterMicros::from_timestamp(ts("2000-01-01T00:00:00Z")).0,
+            0
+        );
+        assert_eq!(MatterMicros(0).to_timestamp(), ts("2000-01-01T00:00:00Z"));
+        assert_eq!(
+            MatterMicros(1_000_000).to_timestamp(),
+            ts("2000-01-01T00:00:01Z")
+        );
+    }
+
+    #[test]
+    fn conversion_round_trips_current_dates() {
+        let now = ts("2026-07-26T20:00:00.123456Z");
+        assert_eq!(MatterMicros::from_timestamp(now).to_timestamp(), now);
+    }
+
+    #[test]
+    fn compact_duration_scales_units() {
+        let cases = [
+            (0, "0us"),
+            (999, "999us"),
+            (412_000, "412ms"),
+            (3_200_000, "3.2s"),
+            (59_000_000, "59s"),
+            (125_000_000, "2m 5s"),
+            (3_840_000_000, "1h 4m"),
+            (90_061_000_000, "1d 1h 1m"),
+        ];
+        for (micros, expected) in cases {
+            assert_eq!(CompactDuration(micros).to_string(), expected);
+        }
+    }
+
+    #[test]
+    fn assessment_reports_unset_clock() {
+        let host = MatterMicros::from_timestamp(ts("2026-07-26T20:00:00Z"));
+        let assessment = ClockAssessment::compare(None, host);
+        assert_eq!(assessment, ClockAssessment::Unset);
+        assert_eq!(assessment.to_string(), "device clock was unset");
+    }
+
+    #[test]
+    fn assessment_reports_direction_and_magnitude() {
+        let host = MatterMicros::from_timestamp(ts("2026-07-26T20:00:00Z"));
+        let behind = ClockAssessment::compare(Some(MatterMicros(host.0 - 83_000_000)), host);
+        assert_eq!(behind.to_string(), "device clock was 1m 23s behind");
+        assert_eq!(behind.effective_delta_micros(), Some(-83_000_000));
+
+        let ahead = ClockAssessment::compare(Some(MatterMicros(host.0 + 5_500_000)), host);
+        assert_eq!(ahead.to_string(), "device clock was 5.5s ahead");
+
+        let close = ClockAssessment::compare(Some(MatterMicros(host.0 - 412_000)), host);
+        assert_eq!(
+            close.to_string(),
+            "device clock was within 1s of host time (412ms behind)"
+        );
+    }
+
+    #[test]
+    fn assessment_detects_wrong_epoch_encoding() {
+        let host = MatterMicros::from_timestamp(ts("2026-07-26T20:00:00Z"));
+        let shift = (MATTER_EPOCH_UNIX_SECONDS * 1_000_000) as u64;
+        let wrong = ClockAssessment::compare(Some(MatterMicros(host.0 + shift + 1_400_000)), host);
+        assert!(wrong.is_epoch_shifted());
+        assert_eq!(wrong.effective_delta_micros(), Some(1_400_000));
+        assert_eq!(
+            wrong.to_string(),
+            "device encodes Unix-epoch time on the wire (off-spec); corrected, its clock was 1.4s ahead"
+        );
+    }
+
+    #[test]
+    fn assessment_does_not_fold_out_ordinary_large_errors() {
+        let host = MatterMicros::from_timestamp(ts("2026-07-26T20:00:00Z"));
+        let shift = (MATTER_EPOCH_UNIX_SECONDS * 1_000_000) as u64;
+        let month = 30 * 86_400 * 1_000_000;
+        let broken = ClockAssessment::compare(Some(MatterMicros(host.0 + shift + month)), host);
+        assert!(!broken.is_epoch_shifted());
+    }
+}
+
+/// Parses an operator-supplied wall-clock time: "16:35", "4:35p", "4:35pm",
+/// each with an optional ":ss". Meridiem suffixes imply 12-hour form.
+pub fn parse_wall_clock(input: &str) -> Result<jiff::civil::Time, String> {
+    let lowered = input.trim().to_ascii_lowercase();
+    let (digits, meridiem) = if let Some(rest) = lowered
+        .strip_suffix("am")
+        .or_else(|| lowered.strip_suffix('a'))
+    {
+        (rest.trim_end(), Some(false))
+    } else if let Some(rest) = lowered
+        .strip_suffix("pm")
+        .or_else(|| lowered.strip_suffix('p'))
+    {
+        (rest.trim_end(), Some(true))
+    } else {
+        (lowered.as_str(), None)
+    };
+
+    let parts: Vec<&str> = digits.split(':').collect();
+    if !(2..=3).contains(&parts.len()) {
+        return Err(format!(
+            "cannot parse {input:?} as a time (expected HH:MM or HH:MM:SS, optionally with am/pm)"
+        ));
+    }
+    let numbers: Vec<u8> = parts
+        .iter()
+        .map(|p| {
+            p.parse()
+                .map_err(|_| format!("cannot parse {p:?} in {input:?} as a number"))
+        })
+        .collect::<Result<_, _>>()?;
+    let (mut hour, minute, second) = (numbers[0], numbers[1], *numbers.get(2).unwrap_or(&0));
+
+    match meridiem {
+        Some(pm) => {
+            if !(1..=12).contains(&hour) {
+                return Err(format!("hour in {input:?} must be 1-12 with am/pm"));
+            }
+            hour = if pm { hour % 12 + 12 } else { hour % 12 };
+        }
+        None if hour > 23 => return Err(format!("hour in {input:?} must be 0-23")),
+        None => {}
+    }
+    jiff::civil::Time::new(hour as i8, minute as i8, second as i8, 0)
+        .map_err(|e| format!("invalid time {input:?}: {e}"))
+}
+
+#[cfg(test)]
+mod wall_clock_tests {
+    use super::parse_wall_clock;
+
+    #[test]
+    fn parses_12_and_24_hour_forms() {
+        let cases = [
+            ("16:35", (16, 35, 0)),
+            ("4:35p", (16, 35, 0)),
+            ("4:35pm", (16, 35, 0)),
+            ("4:35a", (4, 35, 0)),
+            ("12:00am", (0, 0, 0)),
+            ("12:15PM", (12, 15, 0)),
+            ("16:35:20", (16, 35, 20)),
+            ("07:05", (7, 5, 0)),
+        ];
+        for (input, (h, m, s)) in cases {
+            let time = parse_wall_clock(input).unwrap();
+            assert_eq!(
+                (time.hour(), time.minute(), time.second()),
+                (h, m, s),
+                "{input}"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_nonsense() {
+        for input in ["25:00", "13:00pm", "4", "4:60", "0:00am", "banana"] {
+            assert!(parse_wall_clock(input).is_err(), "accepted {input:?}");
+        }
+    }
+}

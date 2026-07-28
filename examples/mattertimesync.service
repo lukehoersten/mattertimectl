@@ -1,0 +1,15 @@
+[Unit]
+Description=Matter device clock synchronization
+Wants=network-online.target
+After=network-online.target time-sync.target
+
+[Service]
+Type=oneshot
+User=mattertimesync
+Group=mattertimesync
+ExecStart=/opt/mattertimesync/mattertimesync --config /etc/mattertimesync/config.json sync
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/mattertimesync
