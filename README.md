@@ -153,6 +153,21 @@ sudo -u mattertimesync /opt/mattertimesync/mattertimesync \
 
 Then `sudo systemctl enable --now mattertimesync.timer` (2 minutes after boot, hourly thereafter).
 
+## Security notes
+
+- **Device attestation is not verified.** Commissioning accepts any device's attestation
+  certificate without checking it against the Connectivity Standards Alliance's Distributed
+  Compliance Ledger (that check needs DCL access this tool does not have). Commissioning still
+  requires the device's SPAKE2+ pairing passcode, so a rogue device cannot join without it, but you
+  cannot cryptographically confirm that a commissioned device is genuine certified hardware.
+- **Outbound network traffic** is limited to Matter (UDP to the device and its border routers),
+  mDNS multicast on the local link, and the clock-trust check: one SNTP query per `sync` to
+  `time.apple.com`, falling back to `pool.ntp.org`. There is no telemetry and no other outbound
+  contact.
+- **The root CA private key** lives unencrypted at rest in `identity.json` (mode 0600 in a 0700
+  storage directory). Back it up as carefully as any private key; anyone who reads it can
+  impersonate this controller to your devices. It is never logged or included in any output.
+
 ## Migrating from the TypeScript implementation
 
 The config file and `service-state.json` carry over unchanged, but the **Matter fabric identity does

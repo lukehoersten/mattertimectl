@@ -23,28 +23,40 @@ impl MatterMicros {
         Self::from_timestamp(Timestamp::now())
     }
 
-    /// Panics on pre-2000 timestamps, which cannot be represented on the
-    /// wire and cannot arise from a running host clock we already required
-    /// to be NTP-synchronized.
+    /// A host clock before the Matter epoch (a Pi with no RTC reads 1970
+    /// early after boot) clamps to 0 rather than panicking; the NTP gate,
+    /// not this conversion, is what keeps a bad clock off a device.
     pub fn from_timestamp(at: Timestamp) -> Self {
         let micros = at.as_microsecond() - MATTER_EPOCH_UNIX_MICROS;
-        Self(u64::try_from(micros).expect("timestamp precedes the Matter epoch"))
+        Self(u64::try_from(micros).unwrap_or(0))
     }
 
-    pub fn to_timestamp(self) -> Timestamp {
-        Timestamp::from_microsecond(self.0 as i64 + MATTER_EPOCH_UNIX_MICROS)
-            .expect("Matter timestamp out of jiff range")
+    /// `None` when the value is outside jiff's representable range: a device
+    /// is free to report any u64 as its clock, and a diagnostic read must
+    /// not panic on garbage.
+    pub fn to_timestamp(self) -> Option<Timestamp> {
+        i64::try_from(self.0)
+            .ok()
+            .and_then(|micros| micros.checked_add(MATTER_EPOCH_UNIX_MICROS))
+            .and_then(|micros| Timestamp::from_microsecond(micros).ok())
     }
 
-    /// Signed delta `self - other` in microseconds.
+    /// Signed delta `self - other` in microseconds, saturating so an
+    /// adversarial device value cannot overflow. i128 has ample headroom
+    /// for two u64 operands; the clamp only bites on nonsense inputs.
     pub fn delta_micros(self, other: Self) -> i64 {
-        self.0 as i64 - other.0 as i64
+        (self.0 as i128 - other.0 as i128).clamp(i64::MIN as i128, i64::MAX as i128) as i64
     }
 }
 
 impl fmt::Display for MatterMicros {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        self.to_timestamp().fmt(f)
+        match self.to_timestamp() {
+            Some(timestamp) => timestamp.fmt(f),
+            // Out of representable range: show the raw value labeled, so a
+            // device reporting garbage is legible rather than a crash.
+            None => write!(f, "{}us-since-matter-epoch(out-of-range)", self.0),
+        }
     }
 }
 
@@ -76,10 +88,10 @@ impl ClockAssessment {
             return Self::Unset;
         };
         let delta_micros = device.delta_micros(host);
-        let shift_error = delta_micros - MATTER_EPOCH_UNIX_MICROS;
+        let shift_error = delta_micros.saturating_sub(MATTER_EPOCH_UNIX_MICROS);
         Self::Offset {
             delta_micros,
-            epoch_shifted: shift_error.abs() <= EPOCH_SHIFT_DETECTION_WINDOW_MICROS,
+            epoch_shifted: shift_error.unsigned_abs() <= EPOCH_SHIFT_DETECTION_WINDOW_MICROS as u64,
         }
     }
 
@@ -92,7 +104,7 @@ impl ClockAssessment {
                 delta_micros,
                 epoch_shifted,
             } => Some(if epoch_shifted {
-                delta_micros - MATTER_EPOCH_UNIX_MICROS
+                delta_micros.saturating_sub(MATTER_EPOCH_UNIX_MICROS)
             } else {
                 delta_micros
             }),
@@ -207,17 +219,42 @@ mod tests {
             MatterMicros::from_timestamp(ts("2000-01-01T00:00:00Z")).0,
             0
         );
-        assert_eq!(MatterMicros(0).to_timestamp(), ts("2000-01-01T00:00:00Z"));
+        assert_eq!(
+            MatterMicros(0).to_timestamp(),
+            Some(ts("2000-01-01T00:00:00Z"))
+        );
         assert_eq!(
             MatterMicros(1_000_000).to_timestamp(),
-            ts("2000-01-01T00:00:01Z")
+            Some(ts("2000-01-01T00:00:01Z"))
         );
     }
 
     #[test]
     fn conversion_round_trips_current_dates() {
         let now = ts("2026-07-26T20:00:00.123456Z");
-        assert_eq!(MatterMicros::from_timestamp(now).to_timestamp(), now);
+        assert_eq!(MatterMicros::from_timestamp(now).to_timestamp(), Some(now));
+    }
+
+    #[test]
+    fn garbage_device_values_do_not_panic() {
+        // A device may report any u64 as its clock; conversion and delta
+        // arithmetic must degrade, not crash.
+        let garbage = MatterMicros(u64::MAX);
+        assert_eq!(garbage.to_timestamp(), None);
+        assert!(garbage.to_string().contains("out-of-range"));
+        let host = MatterMicros::from_timestamp(ts("2026-07-26T20:00:00Z"));
+        let _ = garbage.delta_micros(host); // saturates, no overflow
+        let assessment = ClockAssessment::compare(Some(garbage), host);
+        let _ = assessment.effective_delta_micros();
+        let _ = assessment.to_string();
+    }
+
+    #[test]
+    fn pre_2000_host_clock_clamps_instead_of_panicking() {
+        assert_eq!(
+            MatterMicros::from_timestamp(ts("1970-01-01T00:00:00Z")).0,
+            0
+        );
     }
 
     #[test]

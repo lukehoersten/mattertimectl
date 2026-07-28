@@ -26,7 +26,7 @@ use crate::tz::format_utc_offset;
 /// string, never as a JSON number, which silently loses precision beyond
 /// 2^53 in many consumers. The rule lives in the type, so an ID field
 /// cannot be emitted wrongly.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Id64(pub u64);
 
 impl Serialize for Id64 {

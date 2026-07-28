@@ -94,7 +94,12 @@ pub(crate) fn write_private(path: &Path, bytes: &[u8]) -> io::Result<()> {
         .mode(0o600)
         .open(path)?;
     file.write_all(bytes)?;
-    file.write_all(b"\n")
+    file.write_all(b"\n")?;
+    // Flush to disk before the caller renames over the real file: the
+    // atomicity claim is only true if the temp file's bytes are durable,
+    // otherwise a power loss can surface the rename with empty content and
+    // orphan the root CA key. A one-shot CLI does not care about the cost.
+    file.sync_all()
 }
 
 #[cfg(not(unix))]

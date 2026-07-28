@@ -39,15 +39,44 @@ use static_cell::StaticCell;
 use crate::config::Config;
 use crate::state;
 
+/// Attaches context to a `MatterError`, which does not implement anyhow's
+/// `Context`. Replaces the repeated `.map_err(|e| anyhow!("what: {e:?}"))`
+/// at every rs-matter call site with `.ctx("what")`; the doubled form on
+/// the `Result<Result<_, MatterError>, MatterError>` returned by the
+/// generated `*_read_with` methods flattens with two `.ctx(..)?` in a row.
+trait MatterCtx<T> {
+    fn ctx(self, what: &str) -> anyhow::Result<T>;
+}
+
+impl<T> MatterCtx<T> for Result<T, MatterError> {
+    fn ctx(self, what: &str) -> anyhow::Result<T> {
+        self.map_err(|e| anyhow!("{what}: {e:?}"))
+    }
+}
+
 /// The identity material rs-matter leaves to the caller, persisted as JSON
 /// with the RCAC private key hex-encoded. Mode 0600, next to the KV blobs.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+///
+/// `Debug` is hand-written to redact the key: a `{identity:?}` in any future
+/// log or error must never spill the root CA private key to the journal.
+#[derive(Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Identity {
     pub fabric_id: u64,
     pub controller_node_id: u64,
     pub next_device_node_id: u64,
     pub rcac_privkey_hex: String,
+}
+
+impl std::fmt::Debug for Identity {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Identity")
+            .field("fabric_id", &self.fabric_id)
+            .field("controller_node_id", &self.controller_node_id)
+            .field("next_device_node_id", &self.next_device_node_id)
+            .field("rcac_privkey_hex", &"<redacted>")
+            .finish()
+    }
 }
 
 /// What `status` reports about the controller identity, derived purely from
@@ -244,7 +273,7 @@ pub fn run<O: Op>(config: &Config, op: O) -> anyhow::Result<O::Out> {
         matter
             .load_persist(&kv)
             .await
-            .map_err(|e| anyhow!("load persisted Matter state: {e:?}"))?;
+            .ctx("load persisted Matter state")?;
 
         let (fab_idx, identity) = ensure_fabric(config, matter, &crypto, &kv)?;
         let ctx = Ctx {
@@ -341,7 +370,7 @@ fn ensure_fabric<C: Crypto>(
                 );
                 matter
                     .with_state(|state| state.fabrics.remove(fab_idx))
-                    .map_err(|e| anyhow!("remove interrupted fabric: {e:?}"))?;
+                    .ctx("remove interrupted fabric")?;
                 remove_persisted_fabric(kv, fab_idx)?;
             }
             Err(e) => {
@@ -380,39 +409,37 @@ fn ensure_fabric<C: Crypto>(
     }
 
     log::info!("First run: creating the controller fabric (persistent identity)");
-    let mut identity = Identity::generate(crypto).map_err(|e| anyhow!("{e:?}"))?;
+    let mut identity = Identity::generate(crypto).ctx("generate controller identity")?;
 
     let mut rcac_buf = [0u8; MAX_CERT_TLV_AND_ASN1_LEN];
     let mut rcac_gen = RcacGenerator::new(&mut rcac_buf);
     let (rcac_priv, rcac) = rcac_gen
         .generate(crypto, identity.fabric_id, VALID_FOREVER)
-        .map_err(|e| anyhow!("generate RCAC: {e:?}"))?;
+        .ctx("generate RCAC")?;
     identity.rcac_privkey_hex = hex_encode(rcac_priv.reference().access());
 
     // Our own operational identity: keypair, CSR, NOC signed by the RCAC.
     let controller_key = crypto
         .generate_secret_key()
-        .map_err(|e| anyhow!("generate controller key: {e:?}"))?;
+        .ctx("generate controller key")?;
     let mut csr_buf = [0u8; 256];
-    let csr = controller_key
-        .csr(&mut csr_buf)
-        .map_err(|e| anyhow!("controller CSR: {e:?}"))?;
+    let csr = controller_key.csr(&mut csr_buf).ctx("controller CSR")?;
     let mut controller_key_canon = CanonPkcSecretKey::new();
     controller_key
         .write_canon(&mut controller_key_canon)
-        .map_err(|e| anyhow!("{e:?}"))?;
+        .ctx("serialize controller key")?;
 
     let mut noc_buf = [0u8; MAX_CERT_TLV_AND_ASN1_LEN];
     let mut noc_generator = NocGenerator::create(rcac_priv.reference(), rcac, &[], &mut noc_buf)
-        .map_err(|e| anyhow!("NOC generator: {e:?}"))?;
+        .ctx("NOC generator")?;
     let controller_noc = noc_generator
         .generate(crypto, csr, identity.controller_node_id, &[], VALID_FOREVER)
-        .map_err(|e| anyhow!("controller NOC: {e:?}"))?;
+        .ctx("controller NOC")?;
 
     let mut ipk = CanonAeadKey::new();
     crypto
         .rand()
-        .map_err(|e| anyhow!("{e:?}"))?
+        .ctx("seed fabric IPK")?
         .fill_bytes(ipk.access_mut());
 
     let fab_idx = matter
@@ -433,7 +460,7 @@ fn ensure_fabric<C: Crypto>(
             let _ = state.fabrics.update_label(fab_idx, &config.fabric_label);
             Ok::<_, MatterError>(fab_idx)
         })
-        .map_err(|e| anyhow!("install controller fabric: {e:?}"))?;
+        .ctx("install controller fabric")?;
 
     persist_fabric(matter, kv, fab_idx)?;
 
@@ -637,9 +664,7 @@ async fn with_timeout<T>(
         embassy_time::Duration::from_secs(secs)
     ));
     match embassy_futures::select::select(&mut fut, &mut timer).await {
-        embassy_futures::select::Either::First(result) => {
-            result.map_err(|e| anyhow!("{what}: {e:?}"))
-        }
+        embassy_futures::select::Either::First(result) => result.ctx("{what}"),
         embassy_futures::select::Either::Second(()) => bail!("{what} timed out after {secs}s"),
     }
 }
@@ -685,7 +710,7 @@ impl Op for CommissionOp {
         let mut noc_buf = [0u8; MAX_CERT_TLV_AND_ASN1_LEN];
         let mut noc_generator =
             NocGenerator::new(matter, rcac_privkey.reference(), ctx.fab_idx, &mut noc_buf)
-                .map_err(|e| anyhow!("NOC generator from persisted identity: {e:?}"))?;
+                .ctx("NOC generator from persisted identity")?;
 
         let mut commissioner_buf = [0u8; rs_matter::cert::MAX_CERT_TLV_LEN];
         let mut commissioner = Commissioner::new(
@@ -769,8 +794,8 @@ async fn read_vendor_name<C: Crypto>(ctx: &Ctx<'_, C>, node_id: u64) -> anyhow::
             Ok::<_, MatterError>(())
         })
         .await
-        .map_err(|e| anyhow!("read vendorName: {e:?}"))?
-        .map_err(|e| anyhow!("parse vendorName: {e:?}"))?;
+        .ctx("read vendorName")?
+        .ctx("parse vendorName")?;
     Ok(out)
 }
 
@@ -784,8 +809,8 @@ async fn read_product_name<C: Crypto>(ctx: &Ctx<'_, C>, node_id: u64) -> anyhow:
             Ok::<_, MatterError>(())
         })
         .await
-        .map_err(|e| anyhow!("read productName: {e:?}"))?
-        .map_err(|e| anyhow!("parse productName: {e:?}"))?;
+        .ctx("read productName")?
+        .ctx("parse productName")?;
     Ok(out)
 }
 
@@ -840,6 +865,7 @@ const FEATURE_TIME_ZONE: u32 = 1 << 0;
 
 #[derive(Debug, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
+#[derive(Default)]
 pub struct SyncOutcome {
     pub node_id: crate::output::Id64,
     pub success: bool,
@@ -856,6 +882,28 @@ pub struct SyncOutcome {
     pub dst_entries_written: usize,
     pub delta_after_micros: Option<i64>,
     pub verified: bool,
+}
+
+impl SyncOutcome {
+    /// A node whose sync attempt errored before completing.
+    fn failed(node_id: u64, error: String) -> Self {
+        Self {
+            node_id: node_id.into(),
+            error: Some(error),
+            ..Default::default()
+        }
+    }
+
+    /// A node skipped because it has no Time Synchronization cluster: not a
+    /// failure, so it does not affect the run's exit code.
+    fn skipped(node_id: u64, reason: &str) -> Self {
+        Self {
+            node_id: node_id.into(),
+            skipped: true,
+            error: Some(reason.into()),
+            ..Default::default()
+        }
+    }
 }
 
 pub struct SyncOp {
@@ -877,19 +925,7 @@ impl Op for SyncOp {
             })?;
             let outcome = match sync_one(ctx, node_id, self.manual_time).await {
                 Ok(outcome) => outcome,
-                Err(error) => SyncOutcome {
-                    node_id: node_id.into(),
-                    success: false,
-                    skipped: false,
-                    error: Some(format!("{error:#}")),
-                    clock_before: None,
-                    epoch_shifted: false,
-                    utc_time_written: None,
-                    time_zone_written: None,
-                    dst_entries_written: 0,
-                    delta_after_micros: None,
-                    verified: false,
-                },
+                Err(error) => SyncOutcome::failed(node_id, format!("{error:#}")),
             };
             state::update_node_state(&state_path, node_id, |n| {
                 if outcome.success {
@@ -928,19 +964,10 @@ async fn sync_one<C: Crypto>(
         Ok(map) => map,
         Err(e) if e.code() == rs_matter::error::ErrorCode::ClusterNotFound => {
             log::warn!("Node {node_id}: no Time Synchronization cluster; skipping");
-            return Ok(SyncOutcome {
-                node_id: node_id.into(),
-                success: false,
-                skipped: true,
-                error: Some("no Time Synchronization cluster".into()),
-                clock_before: None,
-                epoch_shifted: false,
-                utc_time_written: None,
-                time_zone_written: None,
-                dst_entries_written: 0,
-                delta_after_micros: None,
-                verified: false,
-            });
+            return Ok(SyncOutcome::skipped(
+                node_id,
+                "no Time Synchronization cluster",
+            ));
         }
         Err(e) => bail!("read featureMap: {e:?}"),
     };
@@ -952,7 +979,7 @@ async fn sync_one<C: Crypto>(
         .time_synchronization()
         .utc_time_read(ROOT_ENDPOINT_ID)
         .await
-        .map_err(|e| anyhow!("read utcTime: {e:?}"))?;
+        .ctx("read utcTime")?;
     let device_before = before.into_option().map(MatterMicros);
     let assessment = ClockAssessment::compare(device_before, MatterMicros::now());
     log::info!("Node {node_id}: {assessment}");
@@ -971,7 +998,7 @@ async fn sync_one<C: Crypto>(
                 .end()
         })
         .await
-        .map_err(|e| anyhow!("SetUTCTime rejected: {e:?}"))?;
+        .ctx("SetUTCTime rejected")?;
     log::info!("Node {node_id}: SetUTCTime {utc_write}");
 
     let mut time_zone_written = None;
@@ -994,15 +1021,12 @@ async fn sync_one<C: Crypto>(
                 list.end()?.end()
             })
             .await
-            .map_err(|e| anyhow!("SetTimeZone rejected: {e:?}"))?;
+            .ctx("SetTimeZone rejected")?;
         let dst_required = response
             .response()
             .map(|r| r.dst_offset_required().unwrap_or(true))
             .unwrap_or(true);
-        response
-            .complete()
-            .await
-            .map_err(|e| anyhow!("SetTimeZone completion: {e:?}"))?;
+        response.complete().await.ctx("SetTimeZone completion")?;
         time_zone_written = Some(ctx.config.timezone.clone());
         log::info!("Node {node_id}: SetTimeZone {}", ctx.config.timezone);
 
@@ -1012,7 +1036,7 @@ async fn sync_one<C: Crypto>(
                 .time_synchronization()
                 .dst_offset_list_max_size_read(ROOT_ENDPOINT_ID)
                 .await
-                .map_err(|e| anyhow!("read dstOffsetListMaxSize: {e:?}"))?;
+                .ctx("read dstOffsetListMaxSize")?;
             let dst_entries = build_dst_offset_list(&tz, usize::from(max_entries), now_ts);
             connect(ctx, node_id)
                 .await?
@@ -1033,7 +1057,7 @@ async fn sync_one<C: Crypto>(
                     list.end()?.end()
                 })
                 .await
-                .map_err(|e| anyhow!("SetDSTOffset rejected: {e:?}"))?;
+                .ctx("SetDSTOffset rejected")?;
             dst_entries_written = dst_entries.len();
             log::info!("Node {node_id}: SetDSTOffset with {dst_entries_written} entries");
         }
@@ -1045,14 +1069,14 @@ async fn sync_one<C: Crypto>(
         .time_synchronization()
         .utc_time_read(ROOT_ENDPOINT_ID)
         .await
-        .map_err(|e| anyhow!("read-back utcTime: {e:?}"))?;
+        .ctx("read-back utcTime")?;
     // Verify against what was WRITTEN (not against "now"): the question is
     // whether the device accepted our value, which also makes verification
     // correct when a manual time was set deliberately far from now.
     let after_assessment =
         ClockAssessment::compare(after.into_option().map(MatterMicros), utc_write);
     let delta_after = after_assessment.effective_delta_micros();
-    let verified = delta_after.is_some_and(|d| d.abs() <= VERIFY_TOLERANCE_MICROS);
+    let verified = delta_after.is_some_and(|d| d.unsigned_abs() <= VERIFY_TOLERANCE_MICROS as u64);
     if !verified {
         bail!("read-back verification failed: {after_assessment}");
     }
@@ -1084,22 +1108,36 @@ async fn ensure_fabric_label<C: Crypto>(ctx: &Ctx<'_, C>, node_id: u64) {
     }
 }
 
-async fn try_ensure_fabric_label<C: Crypto>(ctx: &Ctx<'_, C>, node_id: u64) -> anyhow::Result<()> {
-    let wanted = ctx.config.fabric_label.clone();
-    let mut current: Option<String> = None;
+/// Our own entry in the device's fabric table: its label and device-side
+/// fabric index. A fabric-filtered read returns only our entry, so the loop
+/// keeps the last (only) row. Shared by the label, decommission, and inspect
+/// paths, which each want one or both fields.
+async fn read_our_fabric_entry<C: Crypto>(
+    ctx: &Ctx<'_, C>,
+    node_id: u64,
+) -> anyhow::Result<(Option<String>, Option<u8>)> {
+    let mut label = None;
+    let mut index = None;
     connect(ctx, node_id)
         .await?
         .operational_credentials()
         .fabrics_read_with(ROOT_ENDPOINT_ID, |reader| {
-            // Fabric-filtered read: the device returns only our own entry.
             for item in reader? {
-                current = Some(item?.label()?.to_string());
+                let item = item?;
+                label = Some(item.label()?.to_string());
+                index = item.fabric_index()?;
             }
             Ok::<_, MatterError>(())
         })
         .await
-        .map_err(|e| anyhow!("read fabrics: {e:?}"))?
-        .map_err(|e| anyhow!("parse fabrics: {e:?}"))?;
+        .ctx("read fabrics")?
+        .ctx("parse fabrics")?;
+    Ok((label, index))
+}
+
+async fn try_ensure_fabric_label<C: Crypto>(ctx: &Ctx<'_, C>, node_id: u64) -> anyhow::Result<()> {
+    let wanted = ctx.config.fabric_label.clone();
+    let (current, _) = read_our_fabric_entry(ctx, node_id).await?;
 
     if current.as_deref() == Some(wanted.as_str()) {
         return Ok(());
@@ -1109,12 +1147,12 @@ async fn try_ensure_fabric_label<C: Crypto>(ctx: &Ctx<'_, C>, node_id: u64) -> a
         .operational_credentials()
         .update_fabric_label(ROOT_ENDPOINT_ID, |b| b.label(&wanted)?.end())
         .await
-        .map_err(|e| anyhow!("UpdateFabricLabel: {e:?}"))?;
+        .ctx("UpdateFabricLabel")?;
     let status = response.response().map(|r| r.status_code());
     response
         .complete()
         .await
-        .map_err(|e| anyhow!("UpdateFabricLabel completion: {e:?}"))?;
+        .ctx("UpdateFabricLabel completion")?;
     log::info!("Node {node_id}: fabric label updated to {wanted:?} (status {status:?})");
     Ok(())
 }
@@ -1174,19 +1212,7 @@ impl Op for DecommissionOp {
 /// entry (found through a fabric-filtered read, so no other admin's entry
 /// can even be addressed), while staying paired to its primary ecosystem.
 async fn decommission_one<C: Crypto>(ctx: &Ctx<'_, C>, node_id: u64) -> anyhow::Result<()> {
-    let mut our_index: Option<u8> = None;
-    connect(ctx, node_id)
-        .await?
-        .operational_credentials()
-        .fabrics_read_with(ROOT_ENDPOINT_ID, |reader| {
-            for item in reader? {
-                our_index = item?.fabric_index()?;
-            }
-            Ok::<_, MatterError>(())
-        })
-        .await
-        .map_err(|e| anyhow!("read fabrics: {e:?}"))?
-        .map_err(|e| anyhow!("parse fabrics: {e:?}"))?;
+    let (_, our_index) = read_our_fabric_entry(ctx, node_id).await?;
     let our_index = our_index.ok_or_else(|| anyhow!("device has no entry for our fabric"))?;
 
     log::info!(
@@ -1197,12 +1223,9 @@ async fn decommission_one<C: Crypto>(ctx: &Ctx<'_, C>, node_id: u64) -> anyhow::
         .operational_credentials()
         .remove_fabric(ROOT_ENDPOINT_ID, |b| b.fabric_index(our_index)?.end())
         .await
-        .map_err(|e| anyhow!("RemoveFabric: {e:?}"))?;
+        .ctx("RemoveFabric")?;
     let status = response.response().map(|r| r.status_code());
-    response
-        .complete()
-        .await
-        .map_err(|e| anyhow!("RemoveFabric completion: {e:?}"))?;
+    response.complete().await.ctx("RemoveFabric completion")?;
     log::info!("Node {node_id}: fabric removed (status {status:?})");
     Ok(())
 }
@@ -1270,13 +1293,13 @@ async fn inspect_one<C: Crypto>(ctx: &Ctx<'_, C>, node_id: u64) -> anyhow::Resul
         .time_synchronization()
         .feature_map_read(ROOT_ENDPOINT_ID)
         .await
-        .map_err(|e| anyhow!("read featureMap (device may lack Time Synchronization): {e:?}"))?;
+        .ctx("read featureMap (device may lack Time Synchronization)")?;
     let utc_time = connect(ctx, node_id)
         .await?
         .time_synchronization()
         .utc_time_read(ROOT_ENDPOINT_ID)
         .await
-        .map_err(|e| anyhow!("read utcTime: {e:?}"))?
+        .ctx("read utcTime")?
         .into_option()
         .map(|v| MatterMicros(v).to_string());
     let granularity = connect(ctx, node_id)
@@ -1284,7 +1307,7 @@ async fn inspect_one<C: Crypto>(ctx: &Ctx<'_, C>, node_id: u64) -> anyhow::Resul
         .time_synchronization()
         .granularity_read(ROOT_ENDPOINT_ID)
         .await
-        .map_err(|e| anyhow!("read granularity: {e:?}"))? as u8;
+        .ctx("read granularity")? as u8;
     let has_tz = feature_map & FEATURE_TIME_ZONE != 0;
     let dst_max = if has_tz {
         connect(ctx, node_id)
@@ -1297,22 +1320,7 @@ async fn inspect_one<C: Crypto>(ctx: &Ctx<'_, C>, node_id: u64) -> anyhow::Resul
         0
     };
 
-    let mut label = None;
-    let mut index = None;
-    connect(ctx, node_id)
-        .await?
-        .operational_credentials()
-        .fabrics_read_with(ROOT_ENDPOINT_ID, |reader| {
-            for item in reader? {
-                let item = item?;
-                label = Some(item.label()?.to_string());
-                index = item.fabric_index()?;
-            }
-            Ok::<_, MatterError>(())
-        })
-        .await
-        .map_err(|e| anyhow!("read fabrics: {e:?}"))?
-        .map_err(|e| anyhow!("parse fabrics: {e:?}"))?;
+    let (label, index) = read_our_fabric_entry(ctx, node_id).await?;
 
     Ok(InspectOutcome {
         node_id: node_id.into(),
