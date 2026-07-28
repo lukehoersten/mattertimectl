@@ -17,7 +17,11 @@ use rs_matter::transport::exchange::Exchange;
 use jiff::Timestamp;
 
 use crate::pairing::Onboarding;
-use crate::state::{NodeInfo, NodeRegistry};
+
+/// The device-registry file path for this run's storage.
+fn devices_path<C: Crypto>(ctx: &Ctx<'_, C>) -> std::path::PathBuf {
+    state::devices_path(&ctx.config.storage_path)
+}
 
 const BROWSE_TIMEOUT_MS: u32 = 30_000;
 /// Per-phase bound for commissioning (PASE handshake + invokes, CASE + complete).
@@ -38,7 +42,7 @@ async fn with_timeout<T>(
         embassy_time::Duration::from_secs(secs)
     ));
     match embassy_futures::select::select(&mut fut, &mut timer).await {
-        embassy_futures::select::Either::First(result) => result.ctx("{what}"),
+        embassy_futures::select::Either::First(result) => result.ctx(what),
         embassy_futures::select::Either::Second(()) => bail!("{what} timed out after {secs}s"),
     }
 }
@@ -124,29 +128,17 @@ impl Op for CommissionOp {
         )
         .await?;
 
-        // Cache the device identity for the local registry; best-effort.
+        // Record the device: cached names plus the initial connection.
         let (vendor_name, product_name) = read_device_names(ctx, device_node_id).await;
-
-        let registry_file = state::registry_path(&ctx.config.storage_path);
-        let mut registry: NodeRegistry = state::load_or_default(&registry_file);
-        registry.nodes.insert(
-            device_node_id.to_string(),
-            NodeInfo {
-                vendor_name: vendor_name.clone(),
-                product_name: product_name.clone(),
-            },
-        );
-        state::store(&registry_file, &registry)?;
+        state::update_device(&devices_path(ctx), device_node_id, |device| {
+            device.vendor_name = vendor_name.clone();
+            device.product_name = product_name.clone();
+            device.last_successful_connection = Some(Timestamp::now());
+        })?;
 
         let mut identity = ctx.identity.clone();
         identity.next_device_node_id += 1;
         state::store(&identity_path(&ctx.config.storage_path), &identity)?;
-
-        state::update_node_state(
-            &state::service_state_path(&ctx.config.storage_path),
-            device_node_id,
-            |node| node.last_successful_connection = Some(Timestamp::now()),
-        )?;
 
         Ok(CommissionOutcome {
             node_id: device_node_id.into(),
@@ -314,23 +306,23 @@ impl Op for SyncOp {
     type Out = Vec<SyncOutcome>;
 
     async fn run<C: Crypto>(self, ctx: &Ctx<'_, C>) -> anyhow::Result<Vec<SyncOutcome>> {
-        let state_path = state::service_state_path(&ctx.config.storage_path);
+        let state_path = devices_path(ctx);
         let mut outcomes = Vec::with_capacity(self.targets.len());
         for node_id in self.targets {
-            state::update_node_state(&state_path, node_id, |n| {
-                n.last_attempted_sync = Some(Timestamp::now());
+            state::update_device(&state_path, node_id, |d| {
+                d.last_attempted_sync = Some(Timestamp::now());
             })?;
             let outcome = match sync_one(ctx, node_id, self.manual_time).await {
                 Ok(outcome) => outcome,
                 Err(error) => SyncOutcome::failed(node_id, format!("{error:#}")),
             };
-            state::update_node_state(&state_path, node_id, |n| {
+            state::update_device(&state_path, node_id, |d| {
                 if outcome.success {
-                    n.last_successful_sync = Some(Timestamp::now());
-                    n.last_successful_connection = Some(Timestamp::now());
-                    n.last_error = None;
+                    d.last_successful_sync = Some(Timestamp::now());
+                    d.last_successful_connection = Some(Timestamp::now());
+                    d.last_error = None;
                 } else {
-                    n.last_error = outcome.error.clone();
+                    d.last_error = outcome.error.clone();
                 }
             })?;
             if let Some(error) = &outcome.error {
@@ -398,67 +390,11 @@ async fn sync_one<C: Crypto>(
         .ctx("SetUTCTime rejected")?;
     log::info!("Node {node_id}: SetUTCTime {utc_write}");
 
-    let mut time_zone_written = None;
-    let mut dst_entries_written = 0;
-    if has_time_zone {
-        let zone_entries = build_time_zone_list(&tz, &ctx.config.timezone, now_ts);
-        let response = connect(ctx, node_id)
-            .await?
-            .time_synchronization()
-            .set_time_zone(ROOT_ENDPOINT_ID, |b| {
-                let mut list = b.time_zone()?;
-                for entry in &zone_entries {
-                    list = list
-                        .push()?
-                        .offset(entry.offset_seconds)?
-                        .valid_at(entry.valid_at.0)?
-                        .name(Some(&entry.name))?
-                        .end()?;
-                }
-                list.end()?.end()
-            })
-            .await
-            .ctx("SetTimeZone rejected")?;
-        let dst_required = response
-            .response()
-            .map(|r| r.dst_offset_required().unwrap_or(true))
-            .unwrap_or(true);
-        response.complete().await.ctx("SetTimeZone completion")?;
-        time_zone_written = Some(ctx.config.timezone.clone());
-        log::info!("Node {node_id}: SetTimeZone {}", ctx.config.timezone);
-
-        if dst_required {
-            let max_entries = connect(ctx, node_id)
-                .await?
-                .time_synchronization()
-                .dst_offset_list_max_size_read(ROOT_ENDPOINT_ID)
-                .await
-                .ctx("read dstOffsetListMaxSize")?;
-            let dst_entries = build_dst_offset_list(&tz, usize::from(max_entries), now_ts);
-            connect(ctx, node_id)
-                .await?
-                .time_synchronization()
-                .set_dst_offset(ROOT_ENDPOINT_ID, |b| {
-                    let mut list = b.dst_offset()?;
-                    for entry in &dst_entries {
-                        list = list
-                            .push()?
-                            .offset(entry.offset_seconds)?
-                            .valid_starting(entry.valid_starting.0)?
-                            .valid_until(match entry.valid_until {
-                                Some(until) => rs_matter::tlv::Nullable::some(until.0),
-                                None => rs_matter::tlv::Nullable::none(),
-                            })?
-                            .end()?;
-                    }
-                    list.end()?.end()
-                })
-                .await
-                .ctx("SetDSTOffset rejected")?;
-            dst_entries_written = dst_entries.len();
-            log::info!("Node {node_id}: SetDSTOffset with {dst_entries_written} entries");
-        }
-    }
+    let (time_zone_written, dst_entries_written) = if has_time_zone {
+        write_zone_and_dst(ctx, node_id, &tz, now_ts).await?
+    } else {
+        (None, 0)
+    };
 
     // Verify by reading the clock back.
     let after = connect(ctx, node_id)
@@ -493,6 +429,78 @@ async fn sync_one<C: Crypto>(
         delta_after_micros: delta_after,
         verified,
     })
+}
+
+/// Writes SetTimeZone and (when the device still needs it) SetDSTOffset,
+/// returning the zone name written and the number of DST entries. Split out
+/// of `sync_one` so the two writes read as one cohesive step.
+async fn write_zone_and_dst<C: Crypto>(
+    ctx: &Ctx<'_, C>,
+    node_id: u64,
+    tz: &jiff::tz::TimeZone,
+    now_ts: Timestamp,
+) -> anyhow::Result<(Option<String>, usize)> {
+    let zone_entries = build_time_zone_list(tz, &ctx.config.timezone, now_ts);
+    let response = connect(ctx, node_id)
+        .await?
+        .time_synchronization()
+        .set_time_zone(ROOT_ENDPOINT_ID, |b| {
+            let mut list = b.time_zone()?;
+            for entry in &zone_entries {
+                list = list
+                    .push()?
+                    .offset(entry.offset_seconds)?
+                    .valid_at(entry.valid_at.0)?
+                    .name(Some(&entry.name))?
+                    .end()?;
+            }
+            list.end()?.end()
+        })
+        .await
+        .ctx("SetTimeZone rejected")?;
+    let dst_required = response
+        .response()
+        .map(|r| r.dst_offset_required().unwrap_or(true))
+        .unwrap_or(true);
+    response.complete().await.ctx("SetTimeZone completion")?;
+    log::info!("Node {node_id}: SetTimeZone {}", ctx.config.timezone);
+
+    if !dst_required {
+        return Ok((Some(ctx.config.timezone.clone()), 0));
+    }
+
+    let max_entries = connect(ctx, node_id)
+        .await?
+        .time_synchronization()
+        .dst_offset_list_max_size_read(ROOT_ENDPOINT_ID)
+        .await
+        .ctx("read dstOffsetListMaxSize")?;
+    let dst_entries = build_dst_offset_list(tz, usize::from(max_entries), now_ts);
+    connect(ctx, node_id)
+        .await?
+        .time_synchronization()
+        .set_dst_offset(ROOT_ENDPOINT_ID, |b| {
+            let mut list = b.dst_offset()?;
+            for entry in &dst_entries {
+                list = list
+                    .push()?
+                    .offset(entry.offset_seconds)?
+                    .valid_starting(entry.valid_starting.0)?
+                    .valid_until(match entry.valid_until {
+                        Some(until) => rs_matter::tlv::Nullable::some(until.0),
+                        None => rs_matter::tlv::Nullable::none(),
+                    })?
+                    .end()?;
+            }
+            list.end()?.end()
+        })
+        .await
+        .ctx("SetDSTOffset rejected")?;
+    log::info!(
+        "Node {node_id}: SetDSTOffset with {} entries",
+        dst_entries.len()
+    );
+    Ok((Some(ctx.config.timezone.clone()), dst_entries.len()))
 }
 
 /// Pushes the configured fabric label to the device when it differs from the
@@ -577,14 +585,7 @@ impl Op for DecommissionOp {
             let result = decommission_one(ctx, node_id).await;
             match result {
                 Ok(()) => {
-                    let registry_file = state::registry_path(&ctx.config.storage_path);
-                    let mut registry: NodeRegistry = state::load_or_default(&registry_file);
-                    registry.nodes.remove(&node_id.to_string());
-                    state::store(&registry_file, &registry)?;
-                    state::remove_node_state(
-                        &state::service_state_path(&ctx.config.storage_path),
-                        node_id,
-                    )?;
+                    state::remove_device(&devices_path(ctx), node_id)?;
                     outcomes.push(DecommissionOutcome {
                         node_id: node_id.into(),
                         success: true,
@@ -633,7 +634,7 @@ pub struct InspectOp {
     pub targets: Vec<u64>,
 }
 
-#[derive(Debug, serde::Serialize)]
+#[derive(Debug, Default, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct InspectOutcome {
     pub node_id: crate::output::Id64,
@@ -643,6 +644,17 @@ pub struct InspectOutcome {
     pub time_sync: Option<TimeSyncCaps>,
     pub our_fabric_label: Option<String>,
     pub our_fabric_index: Option<u8>,
+}
+
+impl InspectOutcome {
+    /// A node whose live inspection could not complete.
+    fn failed(node_id: u64, error: String) -> Self {
+        Self {
+            node_id: node_id.into(),
+            error: Some(error),
+            ..Default::default()
+        }
+    }
 }
 
 #[derive(Debug, serde::Serialize)]
@@ -665,15 +677,7 @@ impl Op for InspectOp {
                 Ok(outcome) => outcomes.push(outcome),
                 Err(error) => {
                     log::error!("Node {node_id}: inspect failed: {error:#}");
-                    outcomes.push(InspectOutcome {
-                        node_id: node_id.into(),
-                        error: Some(format!("{error:#}")),
-                        vendor_name: None,
-                        product_name: None,
-                        time_sync: None,
-                        our_fabric_label: None,
-                        our_fabric_index: None,
-                    });
+                    outcomes.push(InspectOutcome::failed(node_id, format!("{error:#}")));
                 }
             }
         }

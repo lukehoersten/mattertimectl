@@ -49,7 +49,7 @@ use jiff::Timestamp;
 
 use crate::config::{Config, DEFAULT_CONFIG_PATH};
 use crate::output::{ConfigReport, DstTransition, NodeListing, Output, StatusReport, SyncReport};
-use crate::state::{NodeRegistry, ServiceState};
+use crate::state::Devices;
 use crate::time::MatterMicros;
 
 #[derive(Parser)]
@@ -182,11 +182,10 @@ fn main() -> ExitCode {
 struct Filter(Option<u64>);
 
 impl Filter {
-    fn retain<V>(&self, map: &mut std::collections::BTreeMap<String, V>) {
-        if let Some(node) = self.0 {
-            let key = node.to_string();
-            map.retain(|k, _| *k == key);
-        }
+    /// Whether a device (keyed by decimal node ID) passes the filter: all
+    /// devices when no `--node` was given, otherwise just the named one.
+    fn keeps(&self, key: &str) -> bool {
+        self.0.is_none_or(|node| key.parse() == Ok(node))
     }
 }
 
@@ -208,9 +207,8 @@ impl Target {
     /// Targets for read-only interrogation: an empty registry is a valid,
     /// empty answer. An explicitly requested unknown node is still an error.
     fn resolve_or_empty(&self, config: &Config) -> anyhow::Result<Vec<u64>> {
-        let registry: NodeRegistry =
-            state::load_or_default(&state::registry_path(&config.storage_path));
-        let known: Vec<u64> = registry.node_ids().collect();
+        let devices: Devices = state::load_or_default(&state::devices_path(&config.storage_path));
+        let known: Vec<u64> = devices.node_ids().collect();
         match self.0 {
             None => Ok(known),
             Some(node) if known.contains(&node) => Ok(vec![node]),
@@ -219,41 +217,42 @@ impl Target {
                 if known.is_empty() {
                     "none".into()
                 } else {
-                    known
-                        .iter()
-                        .map(u64::to_string)
-                        .collect::<Vec<_>>()
-                        .join(", ")
+                    join_ids(&known)
                 }
             ),
         }
     }
 }
 
+/// Comma-joins a slice of displayable values (node IDs) for a message.
+fn join_ids<T: std::fmt::Display>(items: &[T]) -> String {
+    items
+        .iter()
+        .map(T::to_string)
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 fn run_status(config: &Config, filter: Filter) -> anyhow::Result<Output> {
     let tz = config.time_zone();
     let now = Timestamp::now();
-    let state: ServiceState =
-        state::load_or_default(&state::service_state_path(&config.storage_path));
-    let mut registry: NodeRegistry =
-        state::load_or_default(&state::registry_path(&config.storage_path));
-    filter.retain(&mut registry.nodes);
-    let nodes: Vec<NodeListing> = registry
+    let devices: Devices = state::load_or_default(&state::devices_path(&config.storage_path));
+    let nodes: Vec<NodeListing> = devices
         .nodes
         .into_iter()
-        .filter_map(|(key, info)| {
-            // Registry keys are decimal node IDs written by us; anything else
-            // is file corruption and is skipped, matching the lenient loader.
+        .filter(|(key, _)| filter.keeps(key))
+        .filter_map(|(key, device)| {
+            // Keys are decimal node IDs written by us; anything else is file
+            // corruption and is skipped, matching the lenient loader.
             let node_id: u64 = key.parse().ok()?;
-            let node = state.nodes.get(&key).cloned().unwrap_or_default();
             Some(NodeListing {
                 node_id: node_id.into(),
-                vendor_name: info.vendor_name,
-                product_name: info.product_name,
-                last_successful_connection: node.last_successful_connection,
-                last_successful_sync: node.last_successful_sync,
-                last_attempted_sync: node.last_attempted_sync,
-                last_error: node.last_error,
+                vendor_name: device.vendor_name,
+                product_name: device.product_name,
+                last_successful_connection: device.last_successful_connection,
+                last_successful_sync: device.last_successful_sync,
+                last_attempted_sync: device.last_attempted_sync,
+                last_error: device.last_error,
             })
         })
         .collect();
@@ -351,10 +350,9 @@ fn run_commission(config: &Config, code: &str) -> anyhow::Result<Output> {
 fn run_decommission(config: &Config, target: Target) -> anyhow::Result<Output> {
     let targets = target.resolve(config)?;
     let nodes = controller::run(config, controller::DecommissionOp { targets })?;
-    let registry: NodeRegistry =
-        state::load_or_default(&state::registry_path(&config.storage_path));
+    let devices: Devices = state::load_or_default(&state::devices_path(&config.storage_path));
     Ok(Output::Decommission {
         nodes,
-        remaining_nodes: registry.nodes.into_keys().collect(),
+        remaining_nodes: devices.nodes.into_keys().collect(),
     })
 }

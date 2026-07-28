@@ -188,19 +188,16 @@ impl fmt::Display for CompactDuration {
         let hours = (total_seconds % 86_400) / 3_600;
         let minutes = (total_seconds % 3_600) / 60;
         let seconds = total_seconds % 60;
-        let mut parts: Vec<String> = Vec::new();
-        if days > 0 {
-            parts.push(format!("{days}d"));
-        }
-        if hours > 0 {
-            parts.push(format!("{hours}h"));
-        }
-        if minutes > 0 {
-            parts.push(format!("{minutes}m"));
-        }
-        if seconds > 0 && days == 0 {
-            parts.push(format!("{seconds}s"));
-        }
+        let parts: Vec<String> = [
+            (days > 0).then(|| format!("{days}d")),
+            (hours > 0).then(|| format!("{hours}h")),
+            (minutes > 0).then(|| format!("{minutes}m")),
+            // Seconds are dropped once days appear (see the doc comment).
+            (seconds > 0 && days == 0).then(|| format!("{seconds}s")),
+        ]
+        .into_iter()
+        .flatten()
+        .collect();
         f.write_str(&parts.join(" "))
     }
 }
@@ -353,18 +350,16 @@ pub fn parse_wall_clock(input: &str) -> Result<jiff::civil::Time, String> {
                 .map_err(|_| format!("cannot parse {p:?} in {input:?} as a number"))
         })
         .collect::<Result<_, _>>()?;
-    let (mut hour, minute, second) = (numbers[0], numbers[1], *numbers.get(2).unwrap_or(&0));
-
-    match meridiem {
-        Some(pm) => {
-            if !(1..=12).contains(&hour) {
-                return Err(format!("hour in {input:?} must be 1-12 with am/pm"));
-            }
-            hour = if pm { hour % 12 + 12 } else { hour % 12 };
+    let (hour, minute, second) = (numbers[0], numbers[1], *numbers.get(2).unwrap_or(&0));
+    let hour = match meridiem {
+        Some(_) if !(1..=12).contains(&hour) => {
+            return Err(format!("hour in {input:?} must be 1-12 with am/pm"));
         }
+        Some(true) => hour % 12 + 12,
+        Some(false) => hour % 12,
         None if hour > 23 => return Err(format!("hour in {input:?} must be 0-23")),
-        None => {}
-    }
+        None => hour,
+    };
     jiff::civil::Time::new(hour as i8, minute as i8, second as i8, 0)
         .map_err(|e| format!("invalid time {input:?}: {e}"))
 }

@@ -1,13 +1,11 @@
-//! Local service state kept next to the Matter fabric storage.
+//! Local device state kept next to the Matter fabric storage.
 //!
-//! Two small JSON files, both written atomically (temp file + rename) so a
-//! power loss mid-write never corrupts them:
-//!
-//! - `service-state.json`: per-node sync results, file-compatible with the
-//!   TypeScript implementation.
-//! - `nodes.json`: the node registry (id plus cached vendor/product names),
-//!   written at commissioning time so `nodes` and `status` never need to
-//!   start the Matter stack.
+//! One JSON file, `devices.json`, holds a record per commissioned device:
+//! its cached identity (captured at commissioning, so `status` never has to
+//! start the Matter stack) merged with its latest sync results. Written
+//! atomically (temp file + rename) so a power loss mid-write never corrupts
+//! it. The secret (the root CA key in `identity.json`) is a separate file so
+//! these frequent writes never touch it.
 
 use std::collections::BTreeMap;
 use std::io;
@@ -17,50 +15,36 @@ use jiff::Timestamp;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
+/// Everything known locally about one commissioned device.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
-pub struct NodeState {
+pub struct DeviceRecord {
+    pub vendor_name: Option<String>,
+    pub product_name: Option<String>,
     pub last_successful_connection: Option<Timestamp>,
     pub last_successful_sync: Option<Timestamp>,
     pub last_attempted_sync: Option<Timestamp>,
     pub last_error: Option<String>,
 }
 
+/// The device registry: one record per node, keyed by node ID as a decimal
+/// string.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
-pub struct ServiceState {
-    /// Keyed by node ID as a decimal string, like the TypeScript state file.
-    pub nodes: BTreeMap<String, NodeState>,
+pub struct Devices {
+    pub nodes: BTreeMap<String, DeviceRecord>,
 }
 
-/// Cached identity of a commissioned node, captured at commissioning.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", default)]
-pub struct NodeInfo {
-    pub vendor_name: Option<String>,
-    pub product_name: Option<String>,
-}
-
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(default)]
-pub struct NodeRegistry {
-    pub nodes: BTreeMap<String, NodeInfo>,
-}
-
-impl NodeRegistry {
+impl Devices {
     pub fn node_ids(&self) -> impl Iterator<Item = u64> + '_ {
-        // Registry keys are written by us; a non-decimal key would be file
-        // corruption, which the lenient loader already reduces to "empty".
+        // Keys are written by us; a non-decimal key would be file corruption,
+        // which the lenient loader already reduces to "empty".
         self.nodes.keys().filter_map(|key| key.parse().ok())
     }
 }
 
-pub fn service_state_path(storage: &Path) -> PathBuf {
-    storage.join("service-state.json")
-}
-
-pub fn registry_path(storage: &Path) -> PathBuf {
-    storage.join("nodes.json")
+pub fn devices_path(storage: &Path) -> PathBuf {
+    storage.join("devices.json")
 }
 
 /// Reads a state file leniently: missing or corrupt files yield the default.
@@ -107,22 +91,22 @@ pub(crate) fn write_private(path: &Path, bytes: &[u8]) -> io::Result<()> {
     std::fs::write(path, [bytes, b"\n"].concat())
 }
 
-/// Merges a patch into one node's entry and persists the result.
-pub fn update_node_state(
+/// Merges a patch into one device's record and persists the result.
+pub fn update_device(
     path: &Path,
     node_id: u64,
-    patch: impl FnOnce(&mut NodeState),
+    patch: impl FnOnce(&mut DeviceRecord),
 ) -> io::Result<()> {
-    let mut state: ServiceState = load_or_default(path);
-    patch(state.nodes.entry(node_id.to_string()).or_default());
-    store(path, &state)
+    let mut devices: Devices = load_or_default(path);
+    patch(devices.nodes.entry(node_id.to_string()).or_default());
+    store(path, &devices)
 }
 
-/// Drops one node's entry (after decommissioning) and persists the result.
-pub fn remove_node_state(path: &Path, node_id: u64) -> io::Result<()> {
-    let mut state: ServiceState = load_or_default(path);
-    state.nodes.remove(&node_id.to_string());
-    store(path, &state)
+/// Drops one device's record (after decommissioning) and persists the result.
+pub fn remove_device(path: &Path, node_id: u64) -> io::Result<()> {
+    let mut devices: Devices = load_or_default(path);
+    devices.nodes.remove(&node_id.to_string());
+    store(path, &devices)
 }
 
 #[cfg(test)]
@@ -136,64 +120,50 @@ mod tests {
     }
 
     #[test]
-    fn state_round_trips_and_merges() {
-        let path = tempdir().join("service-state.json");
-        update_node_state(&path, 1, |node| {
-            node.last_error = Some("boom".into());
+    fn record_round_trips_and_merges() {
+        let path = tempdir().join("devices.json");
+        update_device(&path, 1, |device| {
+            device.vendor_name = Some("IKEA of Sweden".into());
+            device.last_error = Some("boom".into());
         })
         .unwrap();
-        update_node_state(&path, 1, |node| {
-            node.last_error = None;
-            node.last_successful_sync = Some("2026-07-27T02:20:24.240Z".parse().unwrap());
+        // A later patch merges into the same record, not replacing it.
+        update_device(&path, 1, |device| {
+            device.last_error = None;
+            device.last_successful_sync = Some("2026-07-27T02:20:24.240Z".parse().unwrap());
         })
         .unwrap();
 
-        let state: ServiceState = load_or_default(&path);
-        let node = &state.nodes["1"];
-        assert_eq!(node.last_error, None);
-        assert!(node.last_successful_sync.is_some());
+        let devices: Devices = load_or_default(&path);
+        let device = &devices.nodes["1"];
+        assert_eq!(device.vendor_name.as_deref(), Some("IKEA of Sweden"));
+        assert_eq!(device.last_error, None);
+        assert!(device.last_successful_sync.is_some());
 
-        remove_node_state(&path, 1).unwrap();
-        let state: ServiceState = load_or_default(&path);
-        assert!(state.nodes.is_empty());
-    }
-
-    #[test]
-    fn reads_typescript_state_files() {
-        // Exact shape written by the TypeScript implementation.
-        let raw = r#"{
-            "nodes": {
-                "1": {
-                    "lastSuccessfulConnection": "2026-07-27T02:20:23.357Z",
-                    "lastSuccessfulSync": "2026-07-27T02:20:24.240Z",
-                    "lastAttemptedSync": "2026-07-27T02:20:22.437Z",
-                    "lastError": null
-                }
-            }
-        }"#;
-        let state: ServiceState = serde_json::from_str(raw).unwrap();
-        assert_eq!(state.nodes["1"].last_error, None);
-        assert!(state.nodes["1"].last_successful_sync.is_some());
+        remove_device(&path, 1).unwrap();
+        let devices: Devices = load_or_default(&path);
+        assert!(devices.nodes.is_empty());
     }
 
     #[test]
     fn corrupt_files_reduce_to_defaults() {
         let path = tempdir().join("corrupt.json");
         std::fs::write(&path, "{ not json").unwrap();
-        let state: ServiceState = load_or_default(&path);
-        assert!(state.nodes.is_empty());
+        let devices: Devices = load_or_default(&path);
+        assert!(devices.nodes.is_empty());
     }
 
     #[test]
-    fn registry_lists_node_ids() {
-        let mut registry = NodeRegistry::default();
-        registry.nodes.insert(
+    fn lists_node_ids() {
+        let mut devices = Devices::default();
+        devices.nodes.insert(
             "1".into(),
-            NodeInfo {
+            DeviceRecord {
                 vendor_name: Some("IKEA of Sweden".into()),
                 product_name: Some("ALPSTUGA air quality monitor".into()),
+                ..Default::default()
             },
         );
-        assert_eq!(registry.node_ids().collect::<Vec<_>>(), vec![1]);
+        assert_eq!(devices.node_ids().collect::<Vec<_>>(), vec![1]);
     }
 }

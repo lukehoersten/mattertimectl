@@ -51,8 +51,9 @@ The same principles as the TypeScript implementation this replaces, plus the Rus
   connects retry three times with backoff, since an mDNS resolve answer can be lost per-attempt.
 - **Flat files, no database.** All state is plain files under `storagePath`: rs-matter's KV blobs
   (`matter/k_XXXX`, written atomically via temp+rename), `identity.json` (the root CA private key;
-  mode 0600), `nodes.json` (device registry), and `service-state.json` (per-node sync results). The
-  config and `service-state.json` are file-compatible with the TypeScript implementation.
+  mode 0600, written once and never touched by a sync), and `devices.json` (one record per
+  commissioned device: cached names plus latest sync results). The config is compatible with the
+  TypeScript implementation.
 - **Time is jiff end to end.** Timestamps are `jiff::Timestamp`; Matter-epoch microseconds exist only
   at the wire boundary. DST transitions come directly from the IANA tzdb transition table, never from
   offset probing. Time zones are IANA names, never fixed offsets.
@@ -170,7 +171,7 @@ Then `sudo systemctl enable --now mattertimesync.timer` (2 minutes after boot, h
 
 ## Migrating from the TypeScript implementation
 
-The config file and `service-state.json` carry over unchanged, but the **Matter fabric identity does
+The config file carries over unchanged, but the **Matter fabric identity does
 not**: matter.js and rs-matter persist fabrics in different formats, and the device is paired to a
 key, not a storage path. Migration is one re-pairing:
 

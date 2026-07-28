@@ -100,7 +100,8 @@ pub enum IdentityStatus {
 /// Inspects the identity pair on disk. A fabric blob is any k_* file in the
 /// matter/ KV directory.
 pub fn identity_status(storage: &Path) -> IdentityStatus {
-    let identity_exists = identity_path(storage).exists();
+    let identity_file = identity_path(storage);
+    let identity_exists = identity_file.exists();
     let fabric_exists = std::fs::read_dir(matter_kv_path(storage))
         .map(|entries| {
             entries.flatten().any(|e| {
@@ -119,7 +120,7 @@ pub fn identity_status(storage: &Path) -> IdentityStatus {
         (false, true) => {
             IdentityStatus::Inconsistent("fabric storage exists but identity.json is missing")
         }
-        (true, true) => match std::fs::read_to_string(identity_path(storage))
+        (true, true) => match std::fs::read_to_string(&identity_file)
             .ok()
             .and_then(|raw| serde_json::from_str::<Identity>(&raw).ok())
         {
@@ -349,8 +350,8 @@ fn ensure_fabric<C: Crypto>(
     let identity_file = identity_path(&config.storage_path);
     let existing = matter.with_state(|state| state.fabrics.iter().map(|f| f.fab_idx()).next());
 
-    let registry: crate::state::NodeRegistry =
-        state::load_or_default(&state::registry_path(&config.storage_path));
+    let registry: crate::state::Devices =
+        state::load_or_default(&state::devices_path(&config.storage_path));
 
     if let Some(fab_idx) = existing {
         match std::fs::read_to_string(&identity_file) {
@@ -602,13 +603,7 @@ fn prepare_storage_dir(path: &Path) -> anyhow::Result<()> {
 /// so is safe to claim and tighten.
 #[cfg(unix)]
 fn is_our_storage_dir(path: &Path) -> bool {
-    const MARKERS: [&str; 5] = [
-        "identity.json",
-        "matter",
-        ".lock",
-        "nodes.json",
-        "service-state.json",
-    ];
+    const MARKERS: [&str; 4] = ["identity.json", "matter", ".lock", "devices.json"];
     if MARKERS.iter().any(|m| path.join(m).exists()) {
         return true;
     }
