@@ -116,6 +116,26 @@ pub enum IdentityReport {
     },
 }
 
+impl From<crate::controller::IdentityStatus> for IdentityReport {
+    fn from(status: crate::controller::IdentityStatus) -> Self {
+        use crate::controller::IdentityStatus as S;
+        match status {
+            S::NotCreated => Self::NotCreated,
+            S::Created {
+                fabric_id,
+                controller_node_id,
+            } => Self::Created {
+                fabric_id: fabric_id.to_string(),
+                controller_node_id: controller_node_id.to_string(),
+            },
+            S::Unreadable => Self::Unreadable,
+            S::Inconsistent(reason) => Self::Inconsistent {
+                reason: reason.to_string(),
+            },
+        }
+    }
+}
+
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DstTransition {
@@ -174,7 +194,12 @@ impl Output {
     pub fn print_json(&self) {
         match serde_json::to_string_pretty(self) {
             Ok(body) => println!("{body}"),
-            Err(error) => println!("{{\"error\": \"serialize output: {error}\"}}"),
+            // Build the fallback with the serializer too, so the error text
+            // is escaped and stdout stays valid JSON even here.
+            Err(error) => println!(
+                "{}",
+                serde_json::json!({ "error": format!("serialize output: {error}") })
+            ),
         }
     }
 
@@ -196,6 +221,17 @@ impl Output {
 
 fn display_instant(at: Option<Timestamp>) -> String {
     at.map_or_else(|| "never".into(), |at| at.to_string())
+}
+
+/// The device's vendor and product names joined for display, or `None` when
+/// neither is known; each caller supplies its own fallback text.
+fn device_name(vendor: Option<&str>, product: Option<&str>) -> Option<String> {
+    let joined = [vendor, product]
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>()
+        .join(" ");
+    (!joined.is_empty()).then_some(joined)
 }
 
 fn render_status(report: &StatusReport) {
@@ -271,19 +307,11 @@ fn render_status(report: &StatusReport) {
         report.matter_time_now_microseconds
     );
     for node in &report.nodes {
-        let name = [node.vendor_name.as_deref(), node.product_name.as_deref()]
-            .into_iter()
-            .flatten()
-            .collect::<Vec<_>>()
-            .join(" ");
+        let name = device_name(node.vendor_name.as_deref(), node.product_name.as_deref());
         println!(
             "Node {}: {}",
             node.node_id,
-            if name.is_empty() {
-                "(no cached device info)"
-            } else {
-                &name
-            }
+            name.as_deref().unwrap_or("(no cached device info)")
         );
         println!(
             "  Last connection:      {}",
@@ -399,14 +427,11 @@ fn render_commissioned(outcome: &CommissionOutcome) {
     println!("  Fabric ID:      {}", outcome.fabric_id);
     println!(
         "  Device:         {}",
-        [
+        device_name(
             outcome.vendor_name.as_deref(),
             outcome.product_name.as_deref()
-        ]
-        .into_iter()
-        .flatten()
-        .collect::<Vec<_>>()
-        .join(" ")
+        )
+        .unwrap_or_default()
     );
     println!();
     println!("The device remains paired with its primary ecosystem; this controller");

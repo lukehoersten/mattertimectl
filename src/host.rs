@@ -42,6 +42,14 @@ pub fn clock_is_ntp_synchronized() -> bool {
 /// clock relative to the server (positive = local clock ahead). Uses the
 /// request/response midpoint, so the error is bounded by half the round
 /// trip, which is milliseconds against a threshold of a second.
+///
+/// The request carries a random transmit timestamp that the reply must echo
+/// in its originate field (RFC 4330 §5); this binds the answer to our
+/// request so an off-path packet or a stale reply is rejected. It cannot
+/// stop an on-path attacker, but the gate only decides whether to trust the
+/// *host's own* clock (the device is never set from the NTP value), so the
+/// worst an attacker gains is suppressing sync or blessing an already-wrong
+/// host clock.
 fn sntp_offset(server: &str) -> Option<f64> {
     let socket = UdpSocket::bind(("0.0.0.0", 0)).ok()?;
     socket.set_read_timeout(Some(Duration::from_secs(2))).ok()?;
@@ -49,14 +57,29 @@ fn sntp_offset(server: &str) -> Option<f64> {
 
     let mut request = [0u8; 48];
     request[0] = 0b00_100_011; // LI 0, version 4, mode 3 (client)
+    // Random transmit timestamp (bytes 40..48) used as an anti-spoof nonce.
+    let mut nonce = [0u8; 8];
+    getrandom(&mut nonce);
+    request[40..48].copy_from_slice(&nonce);
     let sent_at = unix_now();
     socket.send(&request).ok()?;
 
     let mut response = [0u8; 48];
     let len = socket.recv(&mut response).ok()?;
     let received_at = unix_now();
-    if len < 48 || response[0] & 0x07 != 4 {
-        // Not a server-mode reply.
+    if len < 48 {
+        return None;
+    }
+    let leap = response[0] >> 6;
+    let mode = response[0] & 0x07;
+    let stratum = response[1];
+    // Reject non-server replies, unsynchronized servers (LI=3), and
+    // kiss-of-death / invalid stratum (0, or 16+ = unsynchronized).
+    if mode != 4 || leap == 3 || !(1..=15).contains(&stratum) {
+        return None;
+    }
+    // The reply's originate timestamp (bytes 24..32) must echo our nonce.
+    if response[24..32] != nonce {
         return None;
     }
 
@@ -69,6 +92,13 @@ fn sntp_offset(server: &str) -> Option<f64> {
         return None;
     }
     Some((sent_at + received_at) / 2.0 - server_time)
+}
+
+/// Fills `buf` with random bytes via rs-matter's crypto RNG (already a
+/// dependency); a nonce only needs unpredictability, not the full clock.
+fn getrandom(buf: &mut [u8]) {
+    use rand::RngCore as _;
+    rand::thread_rng().fill_bytes(buf);
 }
 
 fn unix_now() -> f64 {

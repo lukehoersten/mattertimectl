@@ -48,9 +48,7 @@ use clap::{Parser, Subcommand};
 use jiff::Timestamp;
 
 use crate::config::{Config, DEFAULT_CONFIG_PATH};
-use crate::output::{
-    ConfigReport, DstTransition, IdentityReport, NodeListing, Output, StatusReport, SyncReport,
-};
+use crate::output::{ConfigReport, DstTransition, NodeListing, Output, StatusReport, SyncReport};
 use crate::state::{NodeRegistry, ServiceState};
 use crate::time::MatterMicros;
 
@@ -260,20 +258,7 @@ fn run_status(config: &Config, filter: Filter) -> anyhow::Result<Output> {
         })
         .collect();
 
-    let identity = match controller::identity_status(&config.storage_path) {
-        controller::IdentityStatus::NotCreated => IdentityReport::NotCreated,
-        controller::IdentityStatus::Created {
-            fabric_id,
-            controller_node_id,
-        } => IdentityReport::Created {
-            fabric_id: fabric_id.to_string(),
-            controller_node_id: controller_node_id.to_string(),
-        },
-        controller::IdentityStatus::Unreadable => IdentityReport::Unreadable,
-        controller::IdentityStatus::Inconsistent(reason) => IdentityReport::Inconsistent {
-            reason: reason.to_string(),
-        },
-    };
+    let identity = controller::identity_status(&config.storage_path).into();
     let offset_seconds = tz.to_offset(now).seconds();
     Ok(Output::Status(Box::new(StatusReport {
         config: ConfigReport {
@@ -310,23 +295,24 @@ fn run_inspect(config: &Config, target: Target) -> anyhow::Result<Output> {
     Ok(Output::Inspection { nodes })
 }
 
+/// The requested wall-clock time as a concrete instant: today's date in the
+/// configured zone at that time. The operator is asserting the wall clock, so
+/// the result feeds `--time` directly.
+fn manual_instant(config: &Config, raw: &str) -> anyhow::Result<MatterMicros> {
+    let wall = crate::time::parse_wall_clock(raw).map_err(|e| anyhow::anyhow!(e))?;
+    let tz = config.time_zone();
+    let today = Timestamp::now().to_zoned(tz.clone()).date();
+    let instant = today
+        .at(wall.hour(), wall.minute(), wall.second(), 0)
+        .to_zoned(tz)
+        .map_err(|e| anyhow::anyhow!("cannot place {raw:?} in {}: {e}", config.timezone))?
+        .timestamp();
+    Ok(MatterMicros::from_timestamp(instant))
+}
+
 fn run_sync(config: &Config, target: Target, time: Option<&str>) -> anyhow::Result<Output> {
-    // --time makes the operator the time source: compute today's date in
-    // the configured zone at the requested wall-clock time.
-    let manual_time = match time {
-        None => None,
-        Some(raw) => {
-            let wall = crate::time::parse_wall_clock(raw).map_err(|e| anyhow::anyhow!(e))?;
-            let tz = config.time_zone();
-            let today = Timestamp::now().to_zoned(tz.clone()).date();
-            let instant = today
-                .at(wall.hour(), wall.minute(), wall.second(), 0)
-                .to_zoned(tz)
-                .map_err(|e| anyhow::anyhow!("cannot place {raw:?} in {}: {e}", config.timezone))?
-                .timestamp();
-            Some(MatterMicros::from_timestamp(instant))
-        }
-    };
+    // --time makes the operator the time source.
+    let manual_time = time.map(|raw| manual_instant(config, raw)).transpose()?;
 
     // Fail safe: never push time from a clock that is not NTP-disciplined.
     // Not enforced with --time: the operator deliberately chose the value.

@@ -103,9 +103,12 @@ pub fn identity_status(storage: &Path) -> IdentityStatus {
     let identity_exists = identity_path(storage).exists();
     let fabric_exists = std::fs::read_dir(matter_kv_path(storage))
         .map(|entries| {
-            entries
-                .flatten()
-                .any(|e| e.file_name().to_string_lossy().starts_with("k_"))
+            entries.flatten().any(|e| {
+                let name = e.file_name();
+                let name = name.to_string_lossy();
+                // A committed blob, not a leftover k_XXXX.tmp from a crash.
+                name.starts_with("k_") && !name.ends_with(".tmp")
+            })
         })
         .unwrap_or(false);
     match (identity_exists, fabric_exists) {
@@ -140,16 +143,16 @@ fn matter_kv_path(storage: &Path) -> std::path::PathBuf {
 impl Identity {
     fn generate(crypto: &impl Crypto) -> Result<Self, MatterError> {
         let mut rng = crypto.rand()?;
-        let mut bytes = [0u8; 8];
-        rng.fill_bytes(&mut bytes);
-        // Non-zero 64-bit fabric id; operational node ids for devices are
-        // small and sequential like matter.js's.
-        let fabric_id = u64::from_be_bytes(bytes) | 1;
-        let mut node_bytes = [0u8; 8];
-        rng.fill_bytes(&mut node_bytes);
+        // A non-zero random 64-bit id; device node ids are small and
+        // sequential (assigned from next_device_node_id).
+        let mut random_id = || -> Result<u64, MatterError> {
+            let mut bytes = [0u8; 8];
+            rng.fill_bytes(&mut bytes);
+            Ok(u64::from_be_bytes(bytes) | 1)
+        };
         Ok(Self {
-            fabric_id,
-            controller_node_id: u64::from_be_bytes(node_bytes) | 1,
+            fabric_id: random_id()?,
+            controller_node_id: random_id()?,
             next_device_node_id: 1,
             rcac_privkey_hex: String::new(),
         })
@@ -253,8 +256,7 @@ pub trait Op {
 /// then races the transport and mDNS pumps against `op`. The pumps never
 /// finish on their own; `op` completing ends the run.
 pub fn run<O: Op>(config: &Config, op: O) -> anyhow::Result<O::Out> {
-    std::fs::create_dir_all(&config.storage_path).context("create storage directory")?;
-    restrict_dir_mode(&config.storage_path)?;
+    prepare_storage_dir(&config.storage_path)?;
     // One controller process per storage directory. Held for the process
     // lifetime (flock releases on exit, so no stale-lock handling); this
     // makes the first-run identity bootstrap race-free when a manual run
@@ -296,8 +298,9 @@ pub fn run<O: Op>(config: &Config, op: O) -> anyhow::Result<O::Out> {
         // socket; the connect retries absorb most of that. (The system
         // dnssd backend was tried and is worse: its 10-item browse channel
         // deterministically drops records on Matter-dense networks.)
-        let mdns_socket = bind_mdns_socket().context("bind mDNS socket")?;
         let (mdns_host_ipv4, mdns_ipv6, mdns_interface) = pick_interface()?;
+        let mdns_socket =
+            bind_mdns_socket(mdns_host_ipv4, mdns_interface).context("bind mDNS socket")?;
         let hostname = format!(
             "{:012X}",
             ctx.identity.controller_node_id & 0xFFFF_FFFF_FFFF
@@ -354,7 +357,7 @@ fn ensure_fabric<C: Crypto>(
             Ok(raw) => {
                 let identity: Identity =
                     serde_json::from_str(&raw).context("parse identity.json")?;
-                reconcile_label(matter, crypto, kv, fab_idx, &config.fabric_label)?;
+                reconcile_label(matter, kv, fab_idx, &config.fabric_label)?;
                 return Ok((fab_idx, identity));
             }
             // A fabric blob without identity.json is an interrupted first
@@ -408,6 +411,22 @@ fn ensure_fabric<C: Crypto>(
         );
     }
 
+    bootstrap_fabric(config, matter, crypto, kv)
+}
+
+/// CSA test vendor id: the correct value for an uncertified controller.
+const TEST_VENDOR_ID: u16 = 0xFFF1;
+
+/// First-run fabric creation: mint the RCAC (its private key kept for
+/// RCAC-direct signing), our own operational NOC, and the fabric IPK, then
+/// install and persist the fabric. Called only after [`ensure_fabric`] has
+/// established that the storage is virgin.
+fn bootstrap_fabric<C: Crypto>(
+    config: &Config,
+    matter: &Matter<'static>,
+    crypto: &C,
+    kv: &impl rs_matter::persist::KvBlobStoreAccess,
+) -> anyhow::Result<(NonZeroU8, Identity)> {
     log::info!("First run: creating the controller fabric (persistent identity)");
     let mut identity = Identity::generate(crypto).ctx("generate controller identity")?;
 
@@ -467,7 +486,7 @@ fn ensure_fabric<C: Crypto>(
     // Identity file after the fabric: a crash in between leaves a fabric
     // without identity.json, which the next run reports loudly rather than
     // silently minting a second identity.
-    state::store(&identity_file, &identity).context("write identity.json")?;
+    state::store(&identity_path(&config.storage_path), &identity).context("write identity.json")?;
     log::info!(
         "Controller fabric created and persisted (fabric id {}, controller node id {})",
         identity.fabric_id,
@@ -476,12 +495,8 @@ fn ensure_fabric<C: Crypto>(
     Ok((fab_idx, identity))
 }
 
-/// CSA test vendor id: the correct value for an uncertified controller.
-const TEST_VENDOR_ID: u16 = 0xFFF1;
-
-fn reconcile_label<C: Crypto>(
+fn reconcile_label(
     matter: &Matter<'static>,
-    _crypto: &C,
     kv: &impl rs_matter::persist::KvBlobStoreAccess,
     fab_idx: NonZeroU8,
     label: &str,
@@ -554,19 +569,63 @@ fn lock_storage(_storage: &Path) -> anyhow::Result<std::fs::File> {
     anyhow::bail!("only unix hosts are supported")
 }
 
+/// Creates the storage directory (mode 0700) if absent, and tightens an
+/// existing one to 0700 only when it is ours. Blindly chmod'ing an
+/// operator-supplied path would wreck a misconfigured `storagePath` of, say,
+/// `/tmp` when the tool runs as root, so a pre-existing directory that shows
+/// no sign of belonging to this tool is left untouched with a warning.
 #[cfg(unix)]
-fn restrict_dir_mode(path: &Path) -> anyhow::Result<()> {
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))
-        .context("chmod storage directory")
-}
-
-#[cfg(not(unix))]
-fn restrict_dir_mode(_path: &Path) -> anyhow::Result<()> {
+fn prepare_storage_dir(path: &Path) -> anyhow::Result<()> {
+    use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+    if !path.exists() {
+        return std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(path)
+            .context("create storage directory");
+    }
+    if is_our_storage_dir(path) {
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))
+            .context("chmod storage directory")?;
+    } else {
+        log::warn!(
+            "storagePath {} already exists and does not look like a mattertimesync storage \
+             directory; leaving its permissions unchanged (it should be mode 0700, owned by the \
+             service user)",
+            path.display()
+        );
+    }
     Ok(())
 }
 
-fn bind_mdns_socket() -> anyhow::Result<async_io::Async<UdpSocket>> {
+/// Whether a directory is empty or already holds this tool's artifacts, and
+/// so is safe to claim and tighten.
+#[cfg(unix)]
+fn is_our_storage_dir(path: &Path) -> bool {
+    const MARKERS: [&str; 5] = [
+        "identity.json",
+        "matter",
+        ".lock",
+        "nodes.json",
+        "service-state.json",
+    ];
+    if MARKERS.iter().any(|m| path.join(m).exists()) {
+        return true;
+    }
+    std::fs::read_dir(path)
+        .map(|mut entries| entries.next().is_none())
+        .unwrap_or(false)
+}
+
+#[cfg(not(unix))]
+fn prepare_storage_dir(path: &Path) -> anyhow::Result<()> {
+    std::fs::create_dir_all(path).context("create storage directory")
+}
+
+fn bind_mdns_socket(
+    _ipv4: std::net::Ipv4Addr,
+    interface: u32,
+) -> anyhow::Result<async_io::Async<UdpSocket>> {
     use socket2::{Domain, Protocol, Socket, Type};
     let socket = Socket::new(Domain::IPV6, Type::DGRAM, Some(Protocol::UDP))?;
     socket.set_reuse_address(true)?;
@@ -584,7 +643,6 @@ fn bind_mdns_socket() -> anyhow::Result<async_io::Async<UdpSocket>> {
     // operations on an IPv6 socket that Linux tolerates. Without the group
     // join there is no IPv4 mDNS at all, quietly and identically on every
     // host. A failed IPv6 join, by contrast, means discovery cannot work.
-    let (_ipv4, _ipv6, interface) = pick_interface()?;
     socket
         .get_ref()
         .join_multicast_v6(&MDNS_IPV6_BROADCAST_ADDR, interface)
@@ -751,8 +809,7 @@ impl Op for CommissionOp {
         .await?;
 
         // Cache the device identity for the local registry; best-effort.
-        let vendor_name = read_vendor_name(ctx, device_node_id).await.ok();
-        let product_name = read_product_name(ctx, device_node_id).await.ok();
+        let (vendor_name, product_name) = read_device_names(ctx, device_node_id).await;
 
         let registry_file = state::registry_path(&ctx.config.storage_path);
         let mut registry: NodeRegistry = state::load_or_default(&registry_file);
@@ -784,13 +841,37 @@ impl Op for CommissionOp {
     }
 }
 
+/// The device's vendor and product names for the local registry, each
+/// sanitized and best-effort (`None` if unreadable). Sanitizing matters:
+/// these strings come off the wire from the device and are later printed to
+/// the operator's terminal and journal, so a malicious device must not be
+/// able to smuggle terminal escape sequences through them.
+async fn read_device_names<C: Crypto>(
+    ctx: &Ctx<'_, C>,
+    node_id: u64,
+) -> (Option<String>, Option<String>) {
+    (
+        read_vendor_name(ctx, node_id).await.ok(),
+        read_product_name(ctx, node_id).await.ok(),
+    )
+}
+
+/// Replaces control characters with '?' so a device-supplied string cannot
+/// drive the operator's terminal.
+fn sanitize(value: &str) -> String {
+    value
+        .chars()
+        .map(|c| if c.is_control() { '?' } else { c })
+        .collect()
+}
+
 async fn read_vendor_name<C: Crypto>(ctx: &Ctx<'_, C>, node_id: u64) -> anyhow::Result<String> {
     let exchange = connect(ctx, node_id).await?;
     let mut out = String::new();
     exchange
         .basic_information()
         .vendor_name_read_with(ROOT_ENDPOINT_ID, |value| {
-            out = value?.to_string();
+            out = sanitize(value?);
             Ok::<_, MatterError>(())
         })
         .await
@@ -805,7 +886,7 @@ async fn read_product_name<C: Crypto>(ctx: &Ctx<'_, C>, node_id: u64) -> anyhow:
     exchange
         .basic_information()
         .product_name_read_with(ROOT_ENDPOINT_ID, |value| {
-            out = value?.to_string();
+            out = sanitize(value?);
             Ok::<_, MatterError>(())
         })
         .await
@@ -1285,8 +1366,7 @@ impl Op for InspectOp {
 }
 
 async fn inspect_one<C: Crypto>(ctx: &Ctx<'_, C>, node_id: u64) -> anyhow::Result<InspectOutcome> {
-    let vendor_name = read_vendor_name(ctx, node_id).await.ok();
-    let product_name = read_product_name(ctx, node_id).await.ok();
+    let (vendor_name, product_name) = read_device_names(ctx, node_id).await;
 
     let feature_map = connect(ctx, node_id)
         .await?
