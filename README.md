@@ -19,7 +19,8 @@ There is no daemon: each invocation builds the Matter stack, connects, syncs, an
 
 - The device stays commissioned to its primary ecosystem and attached to its existing Thread or Wi-Fi
   network.
-- A Raspberry Pi (or any Linux host) runs this tool as a second Matter administrator on its own fabric.
+- A Raspberry Pi (or any Linux or macOS host) runs this tool as a second Matter administrator on its
+  own fabric.
 - For Thread devices, the host needs no Thread radio, no OpenThread Border Router, no Thread
   credentials, and no BLE. It reaches the device over IPv6 through the existing Thread Border Routers
   (e.g. HomePod, Apple TV). A host on the same network segment as the border routers learns the route
@@ -120,6 +121,10 @@ than the home name itself; `sync` pushes label changes to each device.
 
 ## Build and deploy
 
+Builds and runs on both Linux and macOS (macOS is handy for building and for commissioning from a
+laptop). The systemd unit below is the Linux deployment; on macOS run the CLI directly or from
+launchd/cron.
+
 ```bash
 cargo build --release       # target/release/mattertimectl, one self-contained binary
 cargo test
@@ -147,7 +152,9 @@ sudo cp examples/mattertimectl.service examples/mattertimectl.timer /etc/systemd
 sudo systemctl daemon-reload
 ```
 
-Commission (as the service user, within the pairing window opened in the primary ecosystem):
+Commissioning is a manual, one-time step per device: it needs a pairing window you open in the
+primary ecosystem, so it cannot run from the timer. Log into the host and run it as the service user,
+inside that window:
 
 ```bash
 sudo -u mattertimectl /opt/mattertimectl/mattertimectl \
