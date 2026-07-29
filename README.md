@@ -29,7 +29,7 @@ There is no daemon: each invocation builds the Matter stack, connects, syncs, an
 
 ## Design
 
-The same principles as the TypeScript implementation this replaces, plus the Rust-specific ones:
+Guiding principles:
 
 - **One-shot CLI, not a daemon.** Being a secondary Matter controller is fabric membership, not a
   running process. Each invocation loads the persisted fabric identity, races the Matter transport and
@@ -55,8 +55,7 @@ The same principles as the TypeScript implementation this replaces, plus the Rus
 - **Flat files, no database.** All state is plain files under `storagePath`: rs-matter's KV blobs
   (`matter/k_XXXX`, written atomically via temp+rename), `identity.json` (the root CA private key;
   mode 0600, written once and never touched by a sync), and `devices.json` (one record per
-  commissioned device: cached names plus latest sync results). The config is compatible with the
-  TypeScript implementation.
+  commissioned device: cached names plus latest sync results).
 - **Time is jiff end to end.** Timestamps are `jiff::Timestamp`; Matter-epoch microseconds exist only
   at the wire boundary. DST transitions come directly from the IANA tzdb transition table, never from
   offset probing. Time zones are IANA names, never fixed offsets.
@@ -96,8 +95,8 @@ Exit codes: 0 success, 1 runtime failure (timer retries), 2 usage/config error.
 
 ## Configuration
 
-`/etc/mattertimectl/config.json` by default; override with `--config <path>`. Same file format as
-the TypeScript implementation (see `examples/config.example.json`):
+`/etc/mattertimectl/config.json` by default; override with `--config <path>` (see
+`examples/config.example.json`):
 
 ```json
 {
@@ -171,18 +170,6 @@ Then `sudo systemctl enable --now mattertimectl.timer` (2 minutes after boot, ho
 - **The root CA private key** lives unencrypted at rest in `identity.json` (mode 0600 in a 0700
   storage directory). Back it up as carefully as any private key; anyone who reads it can
   impersonate this controller to your devices. It is never logged or included in any output.
-
-## Migrating from the TypeScript implementation
-
-The config file carries over unchanged, but the **Matter fabric identity does
-not**: matter.js and rs-matter persist fabrics in different formats, and the device is paired to a
-key, not a storage path. Migration is one re-pairing:
-
-1. Run this implementation with its own fresh `storagePath` and commission the device as an
-   additional admin (Matter allows several; the fabric table has at least 5 slots). Both
-   implementations can sync side by side while validating.
-2. Once satisfied, `decommission` with the **old** implementation so the device drops its fabric,
-   point `mattertimectl.service` at this binary, and delete the old storage directory.
 
 ## Troubleshooting
 
