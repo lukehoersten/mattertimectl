@@ -1,6 +1,7 @@
 # mattertimectl
 
-> Main repository: [src.nth.io/luke/mattertimectl](https://src.nth.io/luke/mattertimectl). The
+> Website: [www.nth.io/mattertimectl](https://www.nth.io/mattertimectl/). Main repository:
+> [src.nth.io/luke/mattertimectl](https://src.nth.io/luke/mattertimectl); the
 > [GitHub mirror](https://github.com/lukehoersten/mattertimectl) is a backup.
 
 A small CLI Matter controller that sets the clocks of Matter devices via the standard Time
