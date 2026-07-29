@@ -16,6 +16,28 @@ ecosystem (e.g. Apple Home) keeps working unchanged.
 
 There is no daemon: each invocation builds the Matter stack, connects, syncs, and exits.
 
+## Commands
+
+| Command | Kind | Description |
+| --- | --- | --- |
+| `status [-n <id>] [-j]` | local, read-only | Controller config, identity, and per-device sync state. No device contact. |
+| `inspect [-n <id>] [-j]` | fabric read | Connect to each device (or one with `-n`) and dump identity, time-sync capabilities, and our fabric entry. |
+| `commission <code> [-j]` | fabric write | Join a device as an additional Matter admin. The pairing code is used once, never logged or stored. |
+| `sync [-n <id>] [-t <hh:mm>] [-j]` | fabric write | Set each device's clock: UTC time, time zone, DST offsets. |
+| `decommission [-n <id>] [-j]` | fabric write | Drop this controller's fabric from each device (or one with `-n`). Primary ecosystems are untouched. |
+
+| Option | Description |
+| --- | --- |
+| `-c, --config <path>` | Config file. Default `/etc/mattertimectl/config.json`. |
+| `-n, --node <id>` | Target one device. `sync` and `decommission` default to all commissioned devices. |
+| `-t, --time <hh:mm>` | `sync` only: set this wall-clock time today (e.g. `16:35`, `4:35pm`) instead of now. The operator becomes the time source and the NTP gate is skipped. |
+| `-j, --json` | Machine-readable JSON on stdout (64-bit values as decimal strings). Logs stay on stderr, so `--json` is always clean. |
+| `-h, --help` / `-V, --version` | Print help / version. |
+
+No command writes local state alone; the registry and sync results change only as part of a
+fabric-writing command. Exit codes: `0` success, `1` runtime failure (the timer retries), `2` usage or
+config error.
+
 ## How it works
 
 - The device stays commissioned to its primary ecosystem and attached to its existing Thread or Wi-Fi
@@ -31,69 +53,20 @@ There is no daemon: each invocation builds the Matter stack, connects, syncs, an
 
 ## Design
 
-Guiding principles:
-
-- **One-shot CLI, not a daemon.** Being a secondary Matter controller is fabric membership, not a
-  running process. Each invocation loads the persisted fabric identity, races the Matter transport and
-  mDNS pumps against the one operation, and exits. Clock staleness is bounded by the systemd timer
-  interval.
-- **Capability-driven, never vendor-specific.** Any device exposing the standard Time Synchronization
-  cluster (0x38) works. SetTimeZone/SetDSTOffset are gated on the device's feature map and bounded by
-  its DSTOffsetListMaxSize; devices without the cluster are skipped with a warning; devices whose
-  firmware encodes Unix-epoch time on the wire are detected by the exact 946,684,800s shift and
-  reported corrected.
-- **The fabric is created exactly once.** First run mints the controller's root CA and operational
-  identity (RCAC-direct mode); every later run loads it. The identity lifecycle is guarded: runs hold
-  an exclusive lock on the storage directory, a fresh identity is only ever minted over provably
-  virgin storage (no fabric, no identity file, no registry entries), the one partial state an
-  interrupted first run can produce is discarded automatically, and any state a commissioned device
-  could depend on is refused loudly rather than overwritten. Reconnection uses Matter operational
-  discovery (mDNS), never a stored IP address.
-- **Fail safely.** Never recommissions automatically; never pushes time unless the host clock is
-  trusted, checked by directly measuring its offset against an NTP server (one SNTP query, accepted
-  under 1s; `timedatectl` as fallback when no server is reachable). Every sync is verified by reading
-  the clock back and comparing against the written instant; non-zero exit lets the timer retry. CASE
-  connects retry three times with backoff, since an mDNS resolve answer can be lost per-attempt.
-- **Flat files, no database.** All state is plain files under `storagePath`: rs-matter's KV blobs
-  (`matter/k_XXXX`, written atomically via temp+rename), `identity.json` (the root CA private key;
-  mode 0600, written once and never touched by a sync), and `devices.json` (one record per
-  commissioned device: cached names plus latest sync results).
-- **Time is jiff end to end.** Timestamps are `jiff::Timestamp`; Matter-epoch microseconds exist only
-  at the wire boundary. DST transitions come directly from the IANA tzdb transition table, never from
-  offset probing. Time zones are IANA names, never fixed offsets.
-- **Intentionally small.** No GUI, database, cloud, QR-code pairing (the primary ecosystem always
-  shows the numeric code), general Matter administration, or debugging surfaces beyond what operating
-  this tool needs.
-
-## Commands
-
-Local, read-only (no device contact):
-
-```bash
-mattertimectl status [--node <id>] [--json]   # config, identity, and per-device sync state
-```
-
-Fabric interrogation (connects to the device, reads only):
-
-```bash
-mattertimectl inspect [--node <id>] [--json]
-```
-
-Fabric-writing:
-
-```bash
-mattertimectl commission <pairing-code>      # writes the device's fabric table + local storage
-mattertimectl sync [--node <id>] [--time <hh:mm>] [--json]   # set clock, time zone, DST offsets
-mattertimectl decommission [--node <id>]     # device(s) drop this controller's fabric
-```
-
-No command writes local state alone; the registry and sync results change only as part of a
-fabric-writing command.
-
-`--node <id>` targets one device; `sync` and `decommission` target all commissioned devices by
-default. `sync --time 16:35` (or `4:35pm`) sets that wall-clock time, today in the configured zone,
-instead of the current time; the operator is then the time source and the NTP gate is not enforced. Logs go to stderr; stdout carries only command output, so `--json` is always clean JSON.
-Exit codes: 0 success, 1 runtime failure (timer retries), 2 usage/config error.
+- **One-shot, not a daemon.** Being a secondary controller is fabric membership, not a process. Each
+  run loads the identity, does one operation, and exits; staleness is bounded by the timer interval.
+- **Capability-driven.** Any device with the standard Time Synchronization cluster (0x38) works.
+  Time-zone/DST writes are gated on the device's feature map; devices without the cluster are skipped.
+- **One fabric, ever.** The controller identity is minted once, only over provably empty storage, under
+  an exclusive lock. Partial first-run state is discarded; state a device depends on is never overwritten.
+- **Fail safe.** Never recommissions on its own. Won't push time unless the host clock is NTP-trusted,
+  and verifies every write by reading the clock back; a non-zero exit lets the timer retry.
+- **Flat files, no database.** All state lives under `storagePath`: rs-matter KV blobs, `identity.json`
+  (the root CA key, mode 0600), and `devices.json` (per-device names and last sync).
+- **Time via jiff.** Timestamps are `jiff::Timestamp`; Matter-epoch microseconds live only at the wire.
+  DST comes from the IANA tzdb, never offset probing; zones are IANA names, never fixed offsets.
+- **Small on purpose.** No GUI, cloud, QR pairing, general Matter administration, or debug surfaces
+  beyond what operating this tool needs.
 
 ## Configuration
 
