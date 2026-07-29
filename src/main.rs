@@ -41,7 +41,7 @@ mod state;
 mod time;
 mod tz;
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
@@ -60,9 +60,11 @@ use crate::time::MatterMicros;
     disable_help_subcommand = true
 )]
 struct Cli {
-    /// Configuration file
-    #[arg(short = 'c', long, global = true, default_value = DEFAULT_CONFIG_PATH)]
-    config: PathBuf,
+    /// Configuration file. Every field is optional; at the default location
+    /// (/etc/mattertimectl/config.json) a missing file uses built-in defaults,
+    /// but a path given here explicitly must exist.
+    #[arg(short = 'c', long, global = true)]
+    config: Option<PathBuf>,
     #[command(subcommand)]
     command: Option<Command>,
 }
@@ -134,7 +136,14 @@ fn main() -> ExitCode {
         return ExitCode::from(2);
     };
 
-    let config = match Config::load(&cli.config) {
+    let loaded = match cli.config.as_deref() {
+        // An explicit --config path is a promise the file exists; a missing
+        // one is a mistake worth surfacing, not silently defaulting past.
+        Some(path) => Config::load(path),
+        // The default location is optional: with no file, run on defaults.
+        None => Config::load_optional(Path::new(DEFAULT_CONFIG_PATH)),
+    };
+    let config = match loaded {
         Ok(config) => config,
         Err(error) => {
             eprintln!("Configuration error: {error}");
@@ -151,7 +160,7 @@ fn main() -> ExitCode {
         log::warn!("{warning}");
     }
 
-    let (json, result) = match command {
+    let (json_flag, result) = match command {
         Command::Status { json, node } => (json, run_status(&config, Filter(node))),
         Command::Inspect { json, node } => (json, run_inspect(&config, Target(node))),
         Command::Sync { json, node, time } => {
@@ -162,6 +171,8 @@ fn main() -> ExitCode {
         }
         Command::Decommission { json, node } => (json, run_decommission(&config, Target(node))),
     };
+    // `-j` forces JSON; otherwise the config's `output` setting decides.
+    let json = json_flag || config.json_output();
 
     let output = result.unwrap_or_else(|error| {
         log::error!("{error:#}");
@@ -266,6 +277,7 @@ fn run_status(config: &Config, filter: Filter) -> anyhow::Result<Output> {
             timezone: config.timezone.clone(),
             log_level: config.log_level.to_string(),
             fabric_label: config.fabric_label.clone(),
+            output: config.output.to_string(),
         },
         storage_initialized: config.storage_path.is_dir(),
         controller_identity: identity,

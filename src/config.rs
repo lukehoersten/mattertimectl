@@ -40,8 +40,8 @@ pub enum ConfigError {
 #[serde(rename_all = "lowercase")]
 pub enum LogLevel {
     Debug,
-    #[default]
     Info,
+    #[default]
     Warn,
     Error,
 }
@@ -69,6 +69,24 @@ impl fmt::Display for LogLevel {
     }
 }
 
+/// Default rendering for commands not given `--json`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum OutputFormat {
+    #[default]
+    Text,
+    Json,
+}
+
+impl fmt::Display for OutputFormat {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            OutputFormat::Text => "text",
+            OutputFormat::Json => "json",
+        })
+    }
+}
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct Config {
@@ -76,9 +94,12 @@ pub struct Config {
     #[serde(skip)]
     pub source: PathBuf,
     /// Directory holding persistent Matter fabric state and service state.
-    /// Contains the controller's private keys; mode 0700.
+    /// Contains the controller's private keys; mode 0700. Defaults to a
+    /// platform-appropriate data directory when omitted.
+    #[serde(default = "default_storage_path")]
     pub storage_path: PathBuf,
     /// IANA time-zone name, e.g. "America/Chicago". Never a fixed UTC offset.
+    /// Defaults to the host's system time zone when omitted.
     #[serde(default = "default_timezone")]
     pub timezone: String,
     #[serde(default)]
@@ -87,14 +108,52 @@ pub struct Config {
     /// Apple Home Connected Services subtitle). Must be unique per device.
     #[serde(default = "default_fabric_label")]
     pub fabric_label: String,
+    /// Default output format for commands not given `--json`. `text` (the
+    /// default) prints the human-readable rendering; `json` makes every
+    /// command emit JSON without a per-call `-j`. `-j` still forces JSON.
+    #[serde(default)]
+    pub output: OutputFormat,
 }
 
+/// The host's IANA time-zone name, used when the config omits `timezone`.
+/// jiff reads the system zone (`/etc/localtime`, `TZ`) on both Linux and
+/// macOS; falls back to UTC if the zone cannot be identified.
 fn default_timezone() -> String {
-    "America/Chicago".into()
+    TimeZone::try_system()
+        .ok()
+        .and_then(|tz| tz.iana_name().map(str::to_string))
+        .unwrap_or_else(|| "UTC".to_string())
+}
+
+/// Platform-appropriate data directory, used when the config omits
+/// `storagePath`. Linux follows the FHS service convention; macOS uses the
+/// per-user Application Support directory, since there is no `/var/lib` there.
+fn default_storage_path() -> PathBuf {
+    #[cfg(target_os = "macos")]
+    if let Some(home) = std::env::var_os("HOME") {
+        return PathBuf::from(home).join("Library/Application Support/mattertimectl");
+    }
+    PathBuf::from("/var/lib/mattertimectl")
 }
 
 fn default_fabric_label() -> String {
     "Matter Time Controller".into()
+}
+
+impl Default for Config {
+    /// The all-defaults configuration: platform data directory, system time
+    /// zone, warn logging, default fabric label. Kept in step with the serde
+    /// field defaults so an empty file and an absent file behave identically.
+    fn default() -> Self {
+        Config {
+            source: PathBuf::new(),
+            storage_path: default_storage_path(),
+            timezone: default_timezone(),
+            log_level: LogLevel::default(),
+            fabric_label: default_fabric_label(),
+            output: OutputFormat::default(),
+        }
+    }
 }
 
 impl Config {
@@ -106,6 +165,28 @@ impl Config {
         let mut config = Self::parse(&raw)?;
         config.source = path.to_owned();
         Ok(config)
+    }
+
+    /// Like [`load`](Self::load), but a missing file is not an error: it
+    /// resolves to the built-in defaults. Used for the default config
+    /// location, which is optional; an explicitly requested file that is
+    /// absent is still an error via [`load`](Self::load).
+    pub fn load_optional(path: &std::path::Path) -> Result<Self, ConfigError> {
+        match std::fs::read_to_string(path) {
+            Ok(raw) => {
+                let mut config = Self::parse(&raw)?;
+                config.source = path.to_owned();
+                Ok(config)
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(Self {
+                source: path.to_owned(),
+                ..Self::default()
+            }),
+            Err(source) => Err(ConfigError::Unreadable {
+                path: path.to_owned(),
+                source,
+            }),
+        }
     }
 
     pub fn parse(raw: &str) -> Result<Self, ConfigError> {
@@ -156,6 +237,12 @@ impl Config {
             .collect()
     }
 
+    /// Whether commands should emit JSON by default (config `output: "json"`),
+    /// without a per-command `-j`. A `-j` flag still forces JSON on top of this.
+    pub fn json_output(&self) -> bool {
+        matches!(self.output, OutputFormat::Json)
+    }
+
     /// The configured zone, resolved against the system tzdb.
     pub fn time_zone(&self) -> TimeZone {
         // Validated at load time; a tzdb that shrinks between then and now is
@@ -177,9 +264,21 @@ mod tests {
             config.storage_path,
             PathBuf::from("/var/lib/mattertimectl")
         );
-        assert_eq!(config.timezone, "America/Chicago");
-        assert_eq!(config.log_level, LogLevel::Info);
+        assert_eq!(config.timezone, default_timezone());
+        assert_eq!(config.log_level, LogLevel::Warn);
         assert_eq!(config.fabric_label, "Matter Time Controller");
+        assert_eq!(config.output, OutputFormat::Text);
+        assert!(!config.json_output());
+    }
+
+    #[test]
+    fn output_format_parses_and_rejects_unknown() {
+        assert_eq!(Config::parse(r#"{}"#).unwrap().output, OutputFormat::Text);
+        let cfg = Config::parse(r#"{ "output": "json" }"#).unwrap();
+        assert_eq!(cfg.output, OutputFormat::Json);
+        assert!(cfg.json_output());
+        // The value is "text"/"json", not "human"/"plain"/etc.
+        assert!(Config::parse(r#"{ "output": "human" }"#).is_err());
     }
 
     #[test]
@@ -237,8 +336,16 @@ mod tests {
     }
 
     #[test]
-    fn storage_path_is_required() {
-        assert!(Config::parse(r#"{}"#).is_err());
+    fn empty_config_uses_platform_defaults() {
+        // Every field is optional: an empty object resolves to the platform
+        // data directory, the host time zone, and the built-in defaults.
+        let config = Config::parse(r#"{}"#).unwrap();
+        assert_eq!(config.storage_path, default_storage_path());
+        assert!(config.storage_path.is_absolute());
+        assert_eq!(config.timezone, default_timezone());
+        assert!(TimeZone::get(&config.timezone).is_ok());
+        assert_eq!(config.log_level, LogLevel::Warn);
+        assert_eq!(config.fabric_label, "Matter Time Controller");
     }
 
     #[test]
@@ -247,6 +354,28 @@ mod tests {
             let raw = format!(r#"{{ "storagePath": "/x", "timezone": {tz:?} }}"#);
             assert!(Config::parse(&raw).is_err(), "accepted {tz:?}");
         }
+    }
+
+    #[test]
+    fn missing_config_at_default_path_uses_defaults() {
+        let cfg = Config::load_optional(std::path::Path::new(
+            "/nonexistent/mattertimectl/does-not-exist.json",
+        ))
+        .unwrap();
+        assert_eq!(cfg.storage_path, default_storage_path());
+        assert_eq!(cfg.timezone, default_timezone());
+        assert_eq!(cfg.log_level, LogLevel::Warn);
+        assert_eq!(cfg.fabric_label, "Matter Time Controller");
+    }
+
+    #[test]
+    fn explicitly_requested_missing_config_errors() {
+        assert!(
+            Config::load(std::path::Path::new(
+                "/nonexistent/mattertimectl/does-not-exist.json"
+            ))
+            .is_err()
+        );
     }
 
     #[test]

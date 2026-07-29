@@ -80,6 +80,7 @@ pub struct ConfigReport {
     pub timezone: String,
     pub log_level: String,
     pub fabric_label: String,
+    pub output: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -246,6 +247,7 @@ fn render_status(report: &StatusReport) {
     println!("  timezone:           {}", report.config.timezone);
     println!("  logLevel:           {}", report.config.log_level);
     println!("  fabricLabel:        {}", report.config.fabric_label);
+    println!("  output:             {}", report.config.output);
     println!(
         "Controller storage:   {}",
         if report.storage_initialized {

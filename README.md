@@ -28,7 +28,7 @@ There is no daemon: each invocation builds the Matter stack, connects, syncs, an
 
 | Option | Description |
 | --- | --- |
-| `-c, --config <path>` | Config file. Default `/etc/mattertimectl/config.json`. |
+| `-c, --config <path>` | Config file. Defaults to `/etc/mattertimectl/config.json` if present; optional there, but a path given explicitly must exist. |
 | `-n, --node <id>` | Target one device. `sync` and `decommission` default to all commissioned devices. |
 | `-t, --time <hh:mm>` | `sync` only: set this wall-clock time today (e.g. `16:35`, `4:35pm`) instead of now. The operator becomes the time source and the NTP gate is skipped. |
 | `-j, --json` | Machine-readable JSON on stdout (64-bit values as decimal strings). Logs stay on stderr, so `--json` is always clean. |
@@ -82,12 +82,19 @@ config error.
 }
 ```
 
+Every field is optional. `storagePath` defaults to `/var/lib/mattertimectl` on Linux and
+`~/Library/Application Support/mattertimectl` on macOS; `timezone` defaults to the host's system
+zone; `logLevel` defaults to `warn`. So a minimal config file is just `{}` — and the file itself is
+optional at the default location: with no `/etc/mattertimectl/config.json`, mattertimectl runs
+entirely on defaults. A path passed with `--config` must exist.
+
 | Field         | Default            | Meaning                                                         |
 | ------------- | ------------------ | --------------------------------------------------------------- |
-| `storagePath` | (required)         | Directory for persistent Matter fabric state. Contains secrets. |
-| `timezone`    | `America/Chicago`  | IANA time-zone name. Never a fixed UTC offset; DST is derived.  |
-| `logLevel`    | `info`             | `debug`, `info`, `warn`, or `error`.                            |
+| `storagePath` | platform data dir  | Directory for persistent Matter fabric state (mode 0700). Contains secrets. |
+| `timezone`    | system zone        | IANA time-zone name. Never a fixed UTC offset; DST is derived.  |
+| `logLevel`    | `warn`             | `debug`, `info`, `warn`, or `error`.                            |
 | `fabricLabel` | `Matter Time Controller` | Label other ecosystems show for this controller (max 32 chars). |
+| `output`      | `text`             | Default output format, `text` or `json`. `json` makes every command emit JSON without a per-call `-j` (which still forces JSON). |
 
 Unknown fields are rejected loudly. Matter requires fabric labels to be unique per device and Apple
 Home labels its own entry with the home's name, so use a variant like "Lakeside Time Sync" rather
