@@ -1,4 +1,7 @@
-# mattertimesync
+# mattertimectl
+
+> Main repository: [src.nth.io/luke/mattertimectl](https://src.nth.io/luke/mattertimectl). The
+> [GitHub mirror](https://github.com/lukehoersten/mattertimectl) is a backup.
 
 A small CLI Matter controller that sets the clocks of Matter devices via the standard Time
 Synchronization cluster. Rust implementation, built on [rs-matter](https://crates.io/crates/rs-matter)
@@ -66,21 +69,21 @@ The same principles as the TypeScript implementation this replaces, plus the Rus
 Local, read-only (no device contact):
 
 ```bash
-mattertimesync status [--node <id>] [--json]   # config, identity, and per-device sync state
+mattertimectl status [--node <id>] [--json]   # config, identity, and per-device sync state
 ```
 
 Fabric interrogation (connects to the device, reads only):
 
 ```bash
-mattertimesync inspect [--node <id>] [--json]
+mattertimectl inspect [--node <id>] [--json]
 ```
 
 Fabric-writing:
 
 ```bash
-mattertimesync commission <pairing-code>      # writes the device's fabric table + local storage
-mattertimesync sync [--node <id>] [--time <hh:mm>] [--json]   # set clock, time zone, DST offsets
-mattertimesync decommission [--node <id>]     # device(s) drop this controller's fabric
+mattertimectl commission <pairing-code>      # writes the device's fabric table + local storage
+mattertimectl sync [--node <id>] [--time <hh:mm>] [--json]   # set clock, time zone, DST offsets
+mattertimectl decommission [--node <id>]     # device(s) drop this controller's fabric
 ```
 
 No command writes local state alone; the registry and sync results change only as part of a
@@ -93,12 +96,12 @@ Exit codes: 0 success, 1 runtime failure (timer retries), 2 usage/config error.
 
 ## Configuration
 
-`/etc/mattertimesync/config.json` by default; override with `--config <path>`. Same file format as
+`/etc/mattertimectl/config.json` by default; override with `--config <path>`. Same file format as
 the TypeScript implementation (see `examples/config.example.json`):
 
 ```json
 {
-  "storagePath": "/var/lib/mattertimesync",
+  "storagePath": "/var/lib/mattertimectl",
   "timezone": "America/Chicago",
   "logLevel": "info",
   "fabricLabel": "My Home"
@@ -110,7 +113,7 @@ the TypeScript implementation (see `examples/config.example.json`):
 | `storagePath` | (required)         | Directory for persistent Matter fabric state. Contains secrets. |
 | `timezone`    | `America/Chicago`  | IANA time-zone name. Never a fixed UTC offset; DST is derived.  |
 | `logLevel`    | `info`             | `debug`, `info`, `warn`, or `error`.                            |
-| `fabricLabel` | `Matter Time Sync` | Label other ecosystems show for this controller (max 32 chars). |
+| `fabricLabel` | `Matter Time Controller` | Label other ecosystems show for this controller (max 32 chars). |
 
 Unknown fields are rejected loudly. Matter requires fabric labels to be unique per device and Apple
 Home labels its own entry with the home's name, so use a variant like "Lakeside Time Sync" rather
@@ -119,7 +122,7 @@ than the home name itself; `sync` pushes label changes to each device.
 ## Build and deploy
 
 ```bash
-cargo build --release       # target/release/mattertimesync, one self-contained binary
+cargo build --release       # target/release/mattertimectl, one self-contained binary
 cargo test
 ```
 
@@ -129,30 +132,30 @@ The binary must match the target's architecture; the simplest path is building o
 ```bash
 # on the Pi, one-time toolchain install (user-local, ~/.rustup and ~/.cargo)
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
-git clone <repository> && cd mattertimesync
+git clone <repository> && cd mattertimectl
 ~/.cargo/bin/cargo build --release
 ```
 
 The target machine needs nothing but the binary (and a tzdb, present on any Linux). On the target:
 
 ```bash
-sudo install -D -m 0755 mattertimesync /opt/mattertimesync/mattertimesync
-sudo useradd --system --home /var/lib/mattertimesync --shell /usr/sbin/nologin mattertimesync
-sudo mkdir -p /etc/mattertimesync /var/lib/mattertimesync
-sudo chown mattertimesync:mattertimesync /var/lib/mattertimesync
-sudo chmod 700 /var/lib/mattertimesync
-sudo cp examples/mattertimesync.service examples/mattertimesync.timer /etc/systemd/system/
+sudo install -D -m 0755 mattertimectl /opt/mattertimectl/mattertimectl
+sudo useradd --system --home /var/lib/mattertimectl --shell /usr/sbin/nologin mattertimectl
+sudo mkdir -p /etc/mattertimectl /var/lib/mattertimectl
+sudo chown mattertimectl:mattertimectl /var/lib/mattertimectl
+sudo chmod 700 /var/lib/mattertimectl
+sudo cp examples/mattertimectl.service examples/mattertimectl.timer /etc/systemd/system/
 sudo systemctl daemon-reload
 ```
 
 Commission (as the service user, within the pairing window opened in the primary ecosystem):
 
 ```bash
-sudo -u mattertimesync /opt/mattertimesync/mattertimesync \
-  --config /etc/mattertimesync/config.json commission 12345678901
+sudo -u mattertimectl /opt/mattertimectl/mattertimectl \
+  --config /etc/mattertimectl/config.json commission 12345678901
 ```
 
-Then `sudo systemctl enable --now mattertimesync.timer` (2 minutes after boot, hourly thereafter).
+Then `sudo systemctl enable --now mattertimectl.timer` (2 minutes after boot, hourly thereafter).
 
 ## Security notes
 
@@ -179,7 +182,7 @@ key, not a storage path. Migration is one re-pairing:
    additional admin (Matter allows several; the fabric table has at least 5 slots). Both
    implementations can sync side by side while validating.
 2. Once satisfied, `decommission` with the **old** implementation so the device drops its fabric,
-   point `mattertimesync.service` at this binary, and delete the old storage directory.
+   point `mattertimectl.service` at this binary, and delete the old storage directory.
 
 ## Troubleshooting
 

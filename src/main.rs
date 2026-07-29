@@ -1,4 +1,4 @@
-//! mattertimesync: a one-shot CLI Matter controller that sets the clocks of
+//! mattertimectl: a one-shot CLI Matter controller that sets the clocks of
 //! Matter devices via the standard Time Synchronization cluster.
 //!
 //! # CLI invariants
@@ -54,7 +54,7 @@ use crate::time::MatterMicros;
 
 #[derive(Parser)]
 #[command(
-    name = "mattertimesync",
+    name = "mattertimectl",
     version,
     about,
     disable_help_subcommand = true

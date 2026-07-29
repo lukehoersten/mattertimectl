@@ -1,6 +1,6 @@
 {
-  "storagePath": "/var/lib/mattertimesync",
+  "storagePath": "/var/lib/mattertimectl",
   "timezone": "America/Chicago",
   "logLevel": "info",
-  "fabricLabel": "Rust Matter Time Sync"
+  "fabricLabel": "Rust Matter Time Controller"
 }

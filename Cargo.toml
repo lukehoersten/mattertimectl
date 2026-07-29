@@ -1,5 +1,5 @@
 [package]
-name = "mattertimesync"
+name = "mattertimectl"
 version = "0.1.0"
 edition = "2024"
 description = "CLI Matter controller that synchronizes the clocks of Matter devices via the standard Time Synchronization cluster"

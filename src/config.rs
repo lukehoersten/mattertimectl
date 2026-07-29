@@ -1,5 +1,5 @@
 //! Validated JSON configuration, file-compatible with the TypeScript
-//! implementation (`/etc/mattertimesync/config.json`, camelCase keys).
+//! implementation (`/etc/mattertimectl/config.json`, camelCase keys).
 //!
 //! Unknown fields are rejected loudly via serde's `deny_unknown_fields`;
 //! device membership deliberately lives in controller storage, not here.
@@ -10,7 +10,7 @@ use std::path::PathBuf;
 use jiff::tz::TimeZone;
 use serde::Deserialize;
 
-pub const DEFAULT_CONFIG_PATH: &str = "/etc/mattertimesync/config.json";
+pub const DEFAULT_CONFIG_PATH: &str = "/etc/mattertimectl/config.json";
 
 /// Matter FabricDescriptorStruct label limit.
 const FABRIC_LABEL_MAX_LENGTH: usize = 32;
@@ -94,7 +94,7 @@ fn default_timezone() -> String {
 }
 
 fn default_fabric_label() -> String {
-    "Matter Time Sync".into()
+    "Matter Time Controller".into()
 }
 
 impl Config {
@@ -168,18 +168,18 @@ impl Config {
 mod tests {
     use super::*;
 
-    const MINIMAL: &str = r#"{ "storagePath": "/var/lib/mattertimesync" }"#;
+    const MINIMAL: &str = r#"{ "storagePath": "/var/lib/mattertimectl" }"#;
 
     #[test]
     fn minimal_config_applies_defaults() {
         let config = Config::parse(MINIMAL).unwrap();
         assert_eq!(
             config.storage_path,
-            PathBuf::from("/var/lib/mattertimesync")
+            PathBuf::from("/var/lib/mattertimectl")
         );
         assert_eq!(config.timezone, "America/Chicago");
         assert_eq!(config.log_level, LogLevel::Info);
-        assert_eq!(config.fabric_label, "Matter Time Sync");
+        assert_eq!(config.fabric_label, "Matter Time Controller");
     }
 
     #[test]
@@ -220,7 +220,7 @@ mod tests {
         let config = Config::parse(r#"{ "storagePath": "/var/lib/$USER/mts" }"#).unwrap();
         assert!(config.path_warnings()[0].contains("unexpanded shell variable"));
 
-        let config = Config::parse(r#"{ "storagePath": "/var/lib/mattertimesync" }"#).unwrap();
+        let config = Config::parse(r#"{ "storagePath": "/var/lib/mattertimectl" }"#).unwrap();
         assert!(config.path_warnings().is_empty());
     }
 

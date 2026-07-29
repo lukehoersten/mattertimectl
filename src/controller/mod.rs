@@ -558,7 +558,7 @@ fn lock_storage(storage: &Path) -> anyhow::Result<std::fs::File> {
     let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
     if rc != 0 {
         bail!(
-            "another mattertimesync instance is already running against {}",
+            "another mattertimectl instance is already running against {}",
             storage.display()
         );
     }
@@ -590,7 +590,7 @@ fn prepare_storage_dir(path: &Path) -> anyhow::Result<()> {
             .context("chmod storage directory")?;
     } else {
         log::warn!(
-            "storagePath {} already exists and does not look like a mattertimesync storage \
+            "storagePath {} already exists and does not look like a mattertimectl storage \
              directory; leaving its permissions unchanged (it should be mode 0700, owned by the \
              service user)",
             path.display()
