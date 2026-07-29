@@ -100,7 +100,7 @@ impl Op for CommissionOp {
         );
         let opts = CommissionOptions {
             // Consumer devices carry vendor DACs we cannot verify without the
-            // DCL; matter.js accepted these the same way.
+            // DCL, so accept them without attestation verification.
             allow_test_attestation: true,
             ..CommissionOptions::new()
         };

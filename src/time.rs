@@ -3,8 +3,8 @@
 //! Matter UTC time is microseconds since 2000-01-01T00:00:00Z (the "Matter
 //! epoch"), not the Unix epoch. `jiff::Timestamp` is the lingua franca
 //! everywhere else in this program; [`MatterMicros`] exists only at the wire
-//! boundary. Unlike matter.js, rs-matter passes spec values through
-//! unconverted, so no Unix-epoch API shift exists here.
+//! boundary. rs-matter passes spec values through unconverted, so no
+//! Unix-epoch API shift exists here.
 
 use std::fmt;
 

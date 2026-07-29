@@ -1,5 +1,5 @@
-//! Validated JSON configuration, file-compatible with the TypeScript
-//! implementation (`/etc/mattertimectl/config.json`, camelCase keys).
+//! Validated JSON configuration (`/etc/mattertimectl/config.json`, camelCase
+//! keys).
 //!
 //! Unknown fields are rejected loudly via serde's `deny_unknown_fields`;
 //! device membership deliberately lives in controller storage, not here.

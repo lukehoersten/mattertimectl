@@ -2,9 +2,8 @@
 //! and offset introspection for status output.
 //!
 //! jiff exposes the real tzdb transition table, so upcoming DST changes are
-//! read directly instead of probed for (the TypeScript implementation had to
-//! binary-search ICU offsets; here `TimeZone::following` is exact by
-//! construction).
+//! read directly instead of probed for by binary-searching offsets;
+//! `TimeZone::following` is exact by construction.
 
 use jiff::Timestamp;
 use jiff::tz::TimeZone;
